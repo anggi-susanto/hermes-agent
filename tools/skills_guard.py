@@ -18,8 +18,11 @@ Usage:
 
     result = scan_skill(Path("skills/.hub/quarantine/some-skill"), source="community")
     allowed, reason = should_allow_install(result)
-    if not allowed:
+    if allowed is False:
         print(format_scan_report(result))
+    elif allowed is None:
+        print(format_scan_report(result))
+        print("Needs confirmation:", reason)
 """
 
 import re
@@ -27,7 +30,7 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 
 
@@ -639,7 +642,7 @@ def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
     )
 
 
-def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[bool, str]:
+def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[Optional[bool], str]:
     """
     Determine whether a skill should be installed based on scan result and trust.
 
@@ -648,7 +651,8 @@ def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[bool,
         force: If True, override blocked policy decisions for this scan result
 
     Returns:
-        (allowed, reason) tuple
+        (allowed, reason) tuple where allowed is True, False, or None
+        (None means the caller should ask for confirmation).
     """
     policy = INSTALL_POLICY.get(result.trust_level, INSTALL_POLICY["community"])
     vi = VERDICT_INDEX.get(result.verdict, 2)

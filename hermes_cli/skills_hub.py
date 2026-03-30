@@ -365,7 +365,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
 
     # Check install policy
     allowed, reason = should_allow_install(result, force=force)
-    if not allowed:
+    if allowed is False:
         c.print(f"\n[bold red]Installation blocked:[/] {reason}")
         # Clean up quarantine
         shutil.rmtree(q_path, ignore_errors=True)

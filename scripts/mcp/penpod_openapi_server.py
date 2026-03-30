@@ -21,11 +21,13 @@ DEFAULT_SPEC_URL = os.getenv(
     "https://prd-srvc-penpod-ext.penpod.id/in/swagger/swagger.json",
 )
 DEFAULT_BASE_URL = os.getenv("PENPOD_API_BASE_URL", "https://prd-srvc-penpod-ext.penpod.id")
+DEFAULT_AUTH_BASE_URL = os.getenv("PENPOD_AUTH_BASE_URL", "https://prd-srvc-auth-ext.penpod.id")
 REQUEST_TIMEOUT = float(os.getenv("PENPOD_API_TIMEOUT_SECONDS", "60"))
 VERIFY_SSL = os.getenv("PENPOD_API_VERIFY_SSL", "true").lower() not in {"0", "false", "no"}
 DEFAULT_LIMIT = int(os.getenv("PENPOD_MCP_DEFAULT_LIMIT", "25"))
 MAX_LIST_LIMIT = int(os.getenv("PENPOD_MCP_MAX_LIST_LIMIT", "200"))
-AUTH_GRANT_PATH = os.getenv("PENPOD_AUTH_GRANT_PATH", "/ex/v1/auth/grant-client")
+AUTH_CLIENT_GRANT_PATH = os.getenv("PENPOD_AUTH_CLIENT_GRANT_PATH", "/ex/v1/auth/grant-client")
+AUTH_USER_GRANT_PATH = os.getenv("PENPOD_AUTH_USER_GRANT_PATH", "/ex/v1/grant/user/password")
 TOKEN_ENV_KEYS = (
     "PENPOD_BEARER_TOKEN",
     "PENPOD_API_TOKEN",
@@ -108,7 +110,14 @@ def _get_auto_bearer_token() -> str | None:
     if not username or not password:
         return None
 
-    url = f"{DEFAULT_BASE_URL.rstrip('/')}/{AUTH_GRANT_PATH.lstrip('/')}"
+    common_headers = {
+        "Accept": "application/json",
+        "User-Agent": "penpod-openapi-mcp/1.0",
+        "Origin": "https://app.penpod.id",
+        "Referer": "https://app.penpod.id/",
+    }
+    client_url = f"{DEFAULT_BASE_URL.rstrip('/')}/{AUTH_CLIENT_GRANT_PATH.lstrip('/')}"
+    user_url = f"{DEFAULT_AUTH_BASE_URL.rstrip('/')}/{AUTH_USER_GRANT_PATH.lstrip('/')}"
     payload_candidates = [
         {"username": username, "password": password},
         {"email": username, "password": password},
@@ -118,15 +127,61 @@ def _get_auto_bearer_token() -> str | None:
 
     with httpx.Client(timeout=REQUEST_TIMEOUT, verify=VERIFY_SSL, follow_redirects=True) as client:
         errors: list[str] = []
+
+        try:
+            client_response = client.post(client_url, headers={**common_headers, "Accept": "*/*"})
+            if not client_response.is_success:
+                errors.append(f"grant-client {client_response.status_code}: {client_response.text[:200]}")
+            else:
+                client_data = client_response.json()
+                client_token = (
+                    (client_data.get("data") or {}).get("access_token")
+                    or client_data.get("access_token")
+                    or client_data.get("token")
+                )
+                if not client_token:
+                    errors.append("grant-client succeeded but returned no access_token")
+                else:
+                    for payload in payload_candidates:
+                        try:
+                            user_response = client.post(
+                                user_url,
+                                json=payload,
+                                headers={
+                                    **common_headers,
+                                    "Authorization": f"Bearer {str(client_token).strip()}",
+                                    "Content-Type": "application/json",
+                                },
+                            )
+                        except Exception as exc:
+                            errors.append(f"grant-user exception: {exc}")
+                            continue
+                        if not user_response.is_success:
+                            errors.append(f"grant-user {user_response.status_code}: {user_response.text[:200]}")
+                            continue
+                        user_data = user_response.json()
+                        user_token = (
+                            (user_data.get("data") or {}).get("token")
+                            or (user_data.get("data") or {}).get("access_token")
+                            or user_data.get("token")
+                            or user_data.get("access_token")
+                        )
+                        if user_token:
+                            return str(user_token).strip()
+                        errors.append("grant-user succeeded but returned no token")
+        except Exception as exc:
+            errors.append(f"grant-client exception: {exc}")
+
+        legacy_url = f"{DEFAULT_BASE_URL.rstrip('/')}/{AUTH_CLIENT_GRANT_PATH.lstrip('/')}"
         for payload in payload_candidates:
             try:
-                response = client.post(url, json=payload, headers={"Accept": "application/json", "User-Agent": "penpod-openapi-mcp/1.0"})
+                response = client.post(legacy_url, json=payload, headers={"Accept": "application/json", "User-Agent": "penpod-openapi-mcp/1.0"})
                 if not response.is_success:
-                    errors.append(f"{response.status_code}: {response.text[:200]}")
+                    errors.append(f"legacy {response.status_code}: {response.text[:200]}")
                     continue
                 data = response.json()
             except Exception as exc:
-                errors.append(str(exc))
+                errors.append(f"legacy exception: {exc}")
                 continue
 
             token = (
@@ -138,8 +193,8 @@ def _get_auto_bearer_token() -> str | None:
                 return str(token).strip()
 
         raise PenpodAPIError(
-            "Failed to auto-acquire Penpod bearer token using PENPOD_USERNAME/PENPOD_PASSWORD via "
-            f"{AUTH_GRANT_PATH}. Errors: {errors}"
+            "Failed to auto-acquire Penpod bearer token using Penpod browser auth flow. "
+            f"Errors: {errors}"
         )
 
 

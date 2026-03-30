@@ -329,6 +329,19 @@ Management commands:
   honcho setup                     — full interactive wizard
 ```
 
+## Evidence snapshot
+
+Local implementation evidence:
+
+- Auth hydration and proxy hardening were validated in the local workspace.
+- Playwright smoke coverage passed: `npx playwright test tests/e2e/smoke.spec.ts tests/e2e/simple-login.spec.ts tests/e2e/auth-flow.spec.ts`
+- Outcome: 7 passed
+
+Scope:
+
+- This is implementation evidence only.
+- It does not replace deployment-side sign-off evidence for main-domain / production gates.
+
 ---
 
 ## openclaw-honcho checklist

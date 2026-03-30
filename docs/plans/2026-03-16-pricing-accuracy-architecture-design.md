@@ -588,6 +588,19 @@ Add tests for:
 
 Current tests that assume heuristic pricing should be replaced with route-aware expectations.
 
+## Evidence snapshot
+
+Local implementation evidence:
+
+- Auth hydration and proxy behavior were validated locally in the repo checkout.
+- Playwright smoke coverage passed: `npx playwright test tests/e2e/smoke.spec.ts tests/e2e/simple-login.spec.ts tests/e2e/auth-flow.spec.ts`
+- Outcome: 7 passed
+
+Scope:
+
+- This confirms the local behavior needed for the implementation lane.
+- It is not production/main-domain sign-off evidence.
+
 ## Non-Goals
 
 - exact enterprise billing reconstruction without an official source or user override

@@ -8,10 +8,12 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -138,6 +140,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._text_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._recent_inbound_messages: Dict[str, float] = {}
+        self._recent_outbound_messages: Dict[str, Dict[str, Any]] = {}
+        self._inbound_dedup_ttl_seconds = float(os.getenv("HERMES_TELEGRAM_INBOUND_DEDUP_TTL_SECONDS", "300"))
+        self._outbound_idempotency_ttl_seconds = float(os.getenv("HERMES_TELEGRAM_OUTBOUND_IDEMPOTENCY_TTL_SECONDS", "120"))
         self._token_lock_identity: Optional[str] = None
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
@@ -154,6 +160,45 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(configured, str):
             configured = configured.split(",")
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
+
+    @staticmethod
+    def _normalize_outbound_content(content: str) -> str:
+        return re.sub(r"\s+", " ", (content or "").strip())
+
+    def _build_outbound_dedup_key(
+        self,
+        chat_id: str,
+        chunks: List[str],
+        reply_to: Optional[str],
+        thread_id: Optional[str],
+    ) -> str:
+        normalized_chunks = [self._normalize_outbound_content(chunk) for chunk in chunks]
+        payload = {
+            "chat_id": str(chat_id),
+            "reply_to": str(reply_to) if reply_to is not None else None,
+            "thread_id": str(thread_id) if thread_id is not None else None,
+            "chunks": normalized_chunks,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _prune_outbound_dedup_cache(self, now: float) -> None:
+        ttl = max(0.0, float(getattr(self, "_outbound_idempotency_ttl_seconds", 0.0) or 0.0))
+        if ttl <= 0:
+            self._recent_outbound_messages.clear()
+            return
+        expired = [
+            key for key, entry in self._recent_outbound_messages.items()
+            if now - float(entry.get("timestamp", 0.0)) > ttl
+        ]
+        for key in expired:
+            self._recent_outbound_messages.pop(key, None)
+
+    @staticmethod
+    def _preview_outbound_text(chunks: List[str], limit: int = 120) -> str:
+        joined = " | ".join(chunk.strip() for chunk in chunks if chunk and chunk.strip())
+        if len(joined) <= limit:
+            return joined
+        return joined[: limit - 1] + "…"
 
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
@@ -226,7 +271,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await self._app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=False,
+                drop_pending_updates=True,
                 error_callback=self._polling_error_callback_ref,
             )
             logger.info(
@@ -273,7 +318,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=False,
+                    drop_pending_updates=True,
                     error_callback=self._polling_error_callback_ref,
                 )
                 logger.info("[%s] Telegram polling resumed after conflict retry %d", self.name, self._polling_conflict_count)
@@ -732,7 +777,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        send_started_at = time.monotonic()
         try:
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -745,10 +791,45 @@ class TelegramAdapter(BasePlatformAdapter):
                     re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
                     for chunk in chunks
                 ]
-            
+
             message_ids = []
             thread_id = metadata.get("thread_id") if metadata else None
-            
+            dedup_key = self._build_outbound_dedup_key(chat_id, chunks, reply_to, thread_id)
+            self._prune_outbound_dedup_cache(send_started_at)
+            cached_send = self._recent_outbound_messages.get(dedup_key)
+            if cached_send:
+                age = send_started_at - float(cached_send.get("timestamp", send_started_at))
+                logger.warning(
+                    "[%s] Suppressed duplicate outbound Telegram send chat_id=%s reply_to=%s thread_id=%s age=%.2fs dedup_key=%s preview=%r",
+                    self.name,
+                    chat_id,
+                    reply_to,
+                    thread_id,
+                    age,
+                    dedup_key[:12],
+                    cached_send.get("preview"),
+                )
+                cached_raw = dict(cached_send.get("raw_response") or {})
+                cached_raw["duplicate_suppressed"] = True
+                cached_raw["duplicate_age_seconds"] = round(age, 3)
+                cached_raw["dedup_key"] = dedup_key
+                return SendResult(
+                    success=True,
+                    message_id=cached_send.get("message_id"),
+                    raw_response=cached_raw,
+                )
+
+            logger.info(
+                "[%s] Telegram send start chat_id=%s reply_to=%s thread_id=%s chunks=%d dedup_key=%s preview=%r",
+                self.name,
+                chat_id,
+                reply_to,
+                thread_id,
+                len(chunks),
+                dedup_key[:12],
+                self._preview_outbound_text(chunks),
+            )
+
             try:
                 from telegram.error import NetworkError as _NetErr
             except ImportError:
@@ -766,8 +847,20 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 msg = None
                 for _send_attempt in range(3):
+                    send_attempt_number = _send_attempt + 1
                     try:
-                        # Try Markdown first, fall back to plain text if it fails
+                        logger.info(
+                            "[%s] Telegram send attempt chat_id=%s chunk=%d/%d attempt=%d reply_to=%s thread_id=%s parse_mode=%s dedup_key=%s",
+                            self.name,
+                            chat_id,
+                            i + 1,
+                            len(chunks),
+                            send_attempt_number,
+                            reply_to_id,
+                            effective_thread_id,
+                            "MarkdownV2",
+                            dedup_key[:12],
+                        )
                         try:
                             msg = await self._bot.send_message(
                                 chat_id=int(chat_id),
@@ -777,10 +870,20 @@ class TelegramAdapter(BasePlatformAdapter):
                                 message_thread_id=effective_thread_id,
                             )
                         except Exception as md_error:
-                            # Markdown parsing failed, try plain text
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
+                                logger.info(
+                                    "[%s] Telegram send retry plain-text chat_id=%s chunk=%d/%d attempt=%d reply_to=%s thread_id=%s dedup_key=%s",
+                                    self.name,
+                                    chat_id,
+                                    i + 1,
+                                    len(chunks),
+                                    send_attempt_number,
+                                    reply_to_id,
+                                    effective_thread_id,
+                                    dedup_key[:12],
+                                )
                                 msg = await self._bot.send_message(
                                     chat_id=int(chat_id),
                                     text=plain_chunk,
@@ -790,53 +893,99 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                             else:
                                 raise
+                        logger.info(
+                            "[%s] Telegram send success chat_id=%s chunk=%d/%d attempt=%d message_id=%s dedup_key=%s",
+                            self.name,
+                            chat_id,
+                            i + 1,
+                            len(chunks),
+                            send_attempt_number,
+                            getattr(msg, "message_id", None),
+                            dedup_key[:12],
+                        )
                         break  # success
                     except _NetErr as send_err:
-                        # BadRequest is a subclass of NetworkError in
-                        # python-telegram-bot but represents permanent errors
-                        # (not transient network issues). Detect and handle
-                        # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             err_lower = str(send_err).lower()
                             if "thread not found" in err_lower and effective_thread_id is not None:
-                                # Thread doesn't exist — retry without
-                                # message_thread_id so the message still
-                                # reaches the chat.
                                 logger.warning(
-                                    "[%s] Thread %s not found, retrying without message_thread_id",
-                                    self.name, effective_thread_id,
+                                    "[%s] Thread %s not found, retrying without message_thread_id chat_id=%s chunk=%d/%d attempt=%d dedup_key=%s",
+                                    self.name,
+                                    effective_thread_id,
+                                    chat_id,
+                                    i + 1,
+                                    len(chunks),
+                                    send_attempt_number,
+                                    dedup_key[:12],
                                 )
                                 effective_thread_id = None
                                 continue
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
-                                # Original message was deleted before we
-                                # could reply — clear reply target and retry
-                                # so the response is still delivered.
                                 logger.warning(
-                                    "[%s] Reply target deleted, retrying without reply_to: %s",
-                                    self.name, send_err,
+                                    "[%s] Reply target deleted, retrying without reply_to chat_id=%s chunk=%d/%d attempt=%d dedup_key=%s error=%s",
+                                    self.name,
+                                    chat_id,
+                                    i + 1,
+                                    len(chunks),
+                                    send_attempt_number,
+                                    dedup_key[:12],
+                                    send_err,
                                 )
                                 reply_to_id = None
                                 continue
-                            # Other BadRequest errors are permanent — don't retry
                             raise
                         if _send_attempt < 2:
                             wait = 2 ** _send_attempt
-                            logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
-                                           self.name, _send_attempt + 1, wait, send_err)
+                            logger.warning(
+                                "[%s] Network error on send chat_id=%s chunk=%d/%d attempt=%d/%d wait=%ds dedup_key=%s error=%s",
+                                self.name,
+                                chat_id,
+                                i + 1,
+                                len(chunks),
+                                send_attempt_number,
+                                3,
+                                wait,
+                                dedup_key[:12],
+                                send_err,
+                            )
                             await asyncio.sleep(wait)
                         else:
+                            logger.error(
+                                "[%s] Telegram send exhausted retries chat_id=%s chunk=%d/%d dedup_key=%s error=%s",
+                                self.name,
+                                chat_id,
+                                i + 1,
+                                len(chunks),
+                                dedup_key[:12],
+                                send_err,
+                            )
                             raise
                 message_ids.append(str(msg.message_id))
-            
+
+            raw_response = {"message_ids": message_ids, "dedup_key": dedup_key}
+            self._recent_outbound_messages[dedup_key] = {
+                "timestamp": time.monotonic(),
+                "message_id": message_ids[0] if message_ids else None,
+                "raw_response": dict(raw_response),
+                "preview": self._preview_outbound_text(chunks),
+            }
+            elapsed = time.monotonic() - send_started_at
+            logger.info(
+                "[%s] Telegram send complete chat_id=%s message_ids=%s dedup_key=%s elapsed=%.3fs",
+                self.name,
+                chat_id,
+                message_ids,
+                dedup_key[:12],
+                elapsed,
+            )
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response=raw_response,
             )
-            
+
         except Exception as e:
-            logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
+            logger.error("[%s] Failed to send Telegram message chat_id=%s: %s", self.name, chat_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
     async def edit_message(
@@ -1488,6 +1637,30 @@ class TelegramAdapter(BasePlatformAdapter):
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
 
+    def _prune_recent_inbound_messages(self, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        cutoff = now - max(self._inbound_dedup_ttl_seconds, 0)
+        stale_keys = [key for key, seen_at in self._recent_inbound_messages.items() if seen_at < cutoff]
+        for key in stale_keys:
+            self._recent_inbound_messages.pop(key, None)
+
+    def _remember_inbound_message(self, message: Message) -> bool:
+        """Return False when Telegram re-delivers an already-seen inbound message."""
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        message_id = getattr(message, "message_id", None)
+        if chat_id is None or message_id is None:
+            return True
+
+        now = time.monotonic()
+        self._prune_recent_inbound_messages(now)
+        dedup_key = f"{chat_id}:{message_id}"
+        if dedup_key in self._recent_inbound_messages:
+            logger.warning("[%s] Ignoring duplicate Telegram inbound message %s", self.name, dedup_key)
+            return False
+        self._recent_inbound_messages[dedup_key] = now
+        return True
+
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
@@ -1522,6 +1695,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not update.message or not update.message.text:
             return
+        if not self._remember_inbound_message(update.message):
+            return
         if not self._should_process_message(update.message):
             return
 
@@ -1533,6 +1708,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
             return
+        if not self._remember_inbound_message(update.message):
+            return
         if not self._should_process_message(update.message, is_command=True):
             return
         
@@ -1542,6 +1719,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
         if not update.message:
+            return
+        if not self._remember_inbound_message(update.message):
             return
         if not self._should_process_message(update.message):
             return
@@ -1687,6 +1866,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
+            return
+        if not self._remember_inbound_message(update.message):
             return
         if not self._should_process_message(update.message):
             return

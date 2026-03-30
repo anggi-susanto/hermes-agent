@@ -113,6 +113,8 @@ async def test_polling_conflict_retries_before_fatal(monkeypatch):
 
     assert adapter.has_fatal_error is False, "First conflict should not be fatal"
     assert adapter._polling_conflict_count == 0, "Count should reset after successful retry"
+    retry_call = updater.start_polling.await_args_list[-1]
+    assert retry_call.kwargs["drop_pending_updates"] is True
 
 
 @pytest.mark.asyncio
@@ -184,6 +186,8 @@ async def test_polling_conflict_becomes_fatal_after_retries(monkeypatch):
     # After 3 failed retries (count 1-3 each enter the retry branch but
     # start_polling raises), the 4th conflict pushes count to 4 which
     # exceeds MAX_CONFLICT_RETRIES (3), entering the fatal branch.
+    retry_calls = updater.start_polling.await_args_list[1:]
+    assert retry_calls and all(call.kwargs["drop_pending_updates"] is True for call in retry_calls)
     assert adapter.fatal_error_code == "telegram_polling_conflict", (
         f"Expected fatal after 4 conflicts, got code={adapter.fatal_error_code}, "
         f"count={adapter._polling_conflict_count}"

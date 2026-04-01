@@ -1,8 +1,25 @@
 from __future__ import annotations
 
+from integrations.boards.base import BoardProvider
 from integrations.boards.models import CompanyRef, CompanySnapshot, IssueRef
 from integrations.boards.sync import BoardSyncStore
 from hermes_state import SessionDB
+
+
+def test_board_provider_contract_has_issue_methods():
+    required = {
+        "validate_credentials",
+        "fetch_company_snapshot",
+        "list_issues",
+        "get_issue",
+        "create_issue",
+        "update_issue",
+        "checkout_issue",
+        "release_issue",
+        "list_issue_comments",
+        "add_issue_comment",
+    }
+    assert required.issubset(set(BoardProvider.__dict__.keys()))
 
 
 def test_sync_store_caches_snapshot_links_issue_and_records_events(tmp_path):
@@ -15,7 +32,7 @@ def test_sync_store_caches_snapshot_links_issue_and_records_events(tmp_path):
             company_id="comp_1",
             company_slug="acme",
             company_name="Acme",
-            credential_ref="paperclip:default",
+            credential_ref="***",
             raw={"seed": True},
         )
 

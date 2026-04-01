@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -24,6 +25,8 @@ import signal
 import tempfile
 import threading
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
@@ -73,12 +76,226 @@ def _ensure_ssl_certs() -> None:
 _ensure_ssl_certs()
 
 
+_DOCUMENT_TEXT_CHAR_LIMIT = 12000
+
+
 def _render_quick_exec_command(template: str, user_args: str) -> str:
     """Render a quick-command exec template with optional argument placeholders."""
     return template.format(
         args=shlex.quote(user_args),
         args_raw=user_args,
     )
+
+
+def _extract_cached_document_display_name(path: str) -> str:
+    """Return a safe human-readable filename for a cached document path."""
+    basename = os.path.basename(path)
+    parts = basename.split("_", 2)
+    display_name = parts[2] if len(parts) >= 3 else basename
+    return re.sub(r'[^\w.\- ]', '_', display_name)
+
+
+def _normalize_document_text(text: str, max_chars: int = _DOCUMENT_TEXT_CHAR_LIMIT) -> str:
+    """Normalize extracted document text for prompt injection."""
+    cleaned = (text or "").replace("\x00", "")
+    cleaned = re.sub(r"\r\n?", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip() + "\n\n[...document text truncated...]"
+
+
+def _extract_docx_text(path: str) -> str:
+    """Extract visible text from a DOCX file using stdlib zip/xml parsing."""
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs: List[str] = []
+    with zipfile.ZipFile(path) as zf:
+        with zf.open("word/document.xml") as fh:
+            root = ET.parse(fh).getroot()
+    for para in root.findall(".//w:p", ns):
+        texts = [node.text or "" for node in para.findall(".//w:t", ns)]
+        joined = "".join(texts).strip()
+        if joined:
+            paragraphs.append(joined)
+    return _normalize_document_text("\n\n".join(paragraphs))
+
+
+def _extract_pptx_text(path: str) -> str:
+    """Extract visible text from a PPTX file using stdlib zip/xml parsing."""
+    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+    slides: List[str] = []
+    with zipfile.ZipFile(path) as zf:
+        slide_names = sorted(
+            name for name in zf.namelist()
+            if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+        )
+        for slide_name in slide_names:
+            with zf.open(slide_name) as fh:
+                root = ET.parse(fh).getroot()
+            texts = [node.text or "" for node in root.findall(".//a:t", ns)]
+            joined = " ".join(part.strip() for part in texts if part and part.strip()).strip()
+            if joined:
+                slides.append(joined)
+    return _normalize_document_text("\n\n".join(slides))
+
+
+def _extract_xlsx_text(path: str) -> str:
+    """Extract readable cell text from an XLSX file using stdlib zip/xml parsing."""
+    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    shared_strings: List[str] = []
+    rows_out: List[str] = []
+
+    def _inline_text(cell: ET.Element) -> str:
+        inline = cell.find("main:is", ns)
+        if inline is None:
+            return ""
+        return "".join(node.text or "" for node in inline.findall(".//main:t", ns)).strip()
+
+    with zipfile.ZipFile(path) as zf:
+        if "xl/sharedStrings.xml" in zf.namelist():
+            with zf.open("xl/sharedStrings.xml") as fh:
+                shared_root = ET.parse(fh).getroot()
+            for si in shared_root.findall("main:si", ns):
+                shared_strings.append(
+                    "".join(node.text or "" for node in si.findall(".//main:t", ns)).strip()
+                )
+
+        sheet_names = sorted(
+            name for name in zf.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        )
+        for sheet_name in sheet_names:
+            with zf.open(sheet_name) as fh:
+                root = ET.parse(fh).getroot()
+            for row in root.findall(".//main:sheetData/main:row", ns):
+                cells: List[str] = []
+                for cell in row.findall("main:c", ns):
+                    cell_type = cell.get("t")
+                    value = ""
+                    if cell_type == "s":
+                        idx_node = cell.find("main:v", ns)
+                        if idx_node is not None and (idx_node.text or "").isdigit():
+                            idx = int(idx_node.text)
+                            if 0 <= idx < len(shared_strings):
+                                value = shared_strings[idx]
+                    elif cell_type == "inlineStr":
+                        value = _inline_text(cell)
+                    else:
+                        val_node = cell.find("main:v", ns)
+                        if val_node is not None and val_node.text:
+                            value = val_node.text.strip()
+                    if value:
+                        cells.append(value)
+                if cells:
+                    rows_out.append("\t".join(cells))
+    return _normalize_document_text("\n".join(rows_out))
+
+
+def _extract_pdf_text(path: str) -> tuple[str, str]:
+    """Extract text from a PDF if PyMuPDF is available."""
+    if importlib.util.find_spec("pymupdf") is None:
+        return "", "backend_unavailable"
+
+    try:
+        import pymupdf  # type: ignore
+
+        doc = pymupdf.open(path)
+        pages = []
+        for page in doc:
+            page_text = page.get_text("text")
+            if page_text and page_text.strip():
+                pages.append(page_text)
+        extracted = _normalize_document_text("\n\n".join(pages))
+        return (extracted, "ok") if extracted else ("", "no_text")
+    except Exception:
+        logger.exception("Document extraction failed for PDF: %s", path)
+        return "", "error"
+
+
+def _build_document_context_parts(paths: List[str], media_types: List[str]) -> List[str]:
+    """Build document context blocks with extracted text or explicit fallback notes."""
+    document_parts: List[str] = []
+    for i, path in enumerate(paths):
+        mtype = media_types[i] if i < len(media_types) else ""
+        if not (mtype.startswith("application/") or mtype.startswith("text/")):
+            continue
+
+        display_name = _extract_cached_document_display_name(path)
+        extracted_text = ""
+        extract_status = "unsupported"
+
+        if mtype.startswith("text/"):
+            try:
+                extracted_text = Path(path).read_text(encoding="utf-8", errors="replace")
+                extracted_text = _normalize_document_text(extracted_text)
+                extract_status = "ok" if extracted_text else "no_text"
+            except Exception:
+                logger.exception("Document extraction failed for text file: %s", path)
+                extract_status = "error"
+        elif mtype == "application/pdf":
+            extracted_text, extract_status = _extract_pdf_text(path)
+        elif mtype in {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+        }:
+            try:
+                extracted_text = _extract_docx_text(path)
+                extract_status = "ok" if extracted_text else "no_text"
+            except Exception:
+                logger.exception("Document extraction failed for Word file: %s", path)
+                extract_status = "error"
+        elif mtype in {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.ms-powerpoint",
+        }:
+            try:
+                extracted_text = _extract_pptx_text(path)
+                extract_status = "ok" if extracted_text else "no_text"
+            except Exception:
+                logger.exception("Document extraction failed for PowerPoint file: %s", path)
+                extract_status = "error"
+        elif mtype in {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        }:
+            try:
+                extracted_text = _extract_xlsx_text(path)
+                extract_status = "ok" if extracted_text else "no_text"
+            except Exception:
+                logger.exception("Document extraction failed for spreadsheet: %s", path)
+                extract_status = "error"
+
+        if extract_status == "ok" and extracted_text:
+            document_parts.append(
+                f"[The user sent a document: '{display_name}'. "
+                f"I extracted readable text from it. The file is also saved at: {path}]\n\n"
+                f"[Extracted content from {display_name}]\n{extracted_text}"
+            )
+        elif extract_status == "backend_unavailable":
+            document_parts.append(
+                f"[The user sent a PDF document: '{display_name}'. The file is saved at: {path}. "
+                "Automatic PDF text extraction/OCR is unavailable on this Hermes instance because the PDF backend is not installed. "
+                "Tell the user OCR isn't configured yet and ask them to paste the text or have an admin install PyMuPDF/pymupdf if they want automatic extraction.]"
+            )
+        elif extract_status == "no_text":
+            document_parts.append(
+                f"[The user sent a document: '{display_name}'. The file is saved at: {path}, "
+                "but I couldn't find readable embedded text in it. It may be image-only/scanned, so OCR would be needed. "
+                "Tell the user OCR isn't available for this file yet and ask for a clearer export or pasted text.]"
+            )
+        elif extract_status == "error":
+            document_parts.append(
+                f"[The user sent a document: '{display_name}'. The file is saved at: {path}, "
+                "but automatic extraction failed unexpectedly. Let the user know document/OCR processing hit an error and ask them to retry or share the text directly.]"
+            )
+        else:
+            document_parts.append(
+                f"[The user sent a document: '{display_name}'. The file is saved at: {path}. "
+                f"I don't have automatic extraction for MIME type '{mtype or 'unknown'}' yet, so ask the user what they'd like to do with it.]"
+            )
+
+    return document_parts
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -2513,36 +2730,16 @@ class GatewayRunner:
                             pass
 
         # -----------------------------------------------------------------
-        # Enrich document messages with context notes for the agent
+        # Enrich document messages with extracted text or explicit fallback notes
         # -----------------------------------------------------------------
         if event.media_urls and event.message_type == MessageType.DOCUMENT:
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                if not (mtype.startswith("application/") or mtype.startswith("text/")):
-                    continue
-                # Extract display filename by stripping the doc_{uuid12}_ prefix
-                import os as _os
-                basename = _os.path.basename(path)
-                # Format: doc_<12hex>_<original_filename>
-                parts = basename.split("_", 2)
-                display_name = parts[2] if len(parts) >= 3 else basename
-                # Sanitize to prevent prompt injection via filenames
-                import re as _re
-                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
-
-                if mtype.startswith("text/"):
-                    context_note = (
-                        f"[The user sent a text document: '{display_name}'. "
-                        f"Its content has been included below. "
-                        f"The file is also saved at: {path}]"
-                    )
+            document_parts = _build_document_context_parts(event.media_urls, event.media_types)
+            if document_parts:
+                prefix = "\n\n".join(document_parts)
+                if message_text:
+                    message_text = f"{prefix}\n\n{message_text}"
                 else:
-                    context_note = (
-                        f"[The user sent a document: '{display_name}'. "
-                        f"The file is saved at: {path}. "
-                        f"Ask the user what they'd like you to do with it.]"
-                    )
-                message_text = f"{context_note}\n\n{message_text}"
+                    message_text = prefix
 
         # -----------------------------------------------------------------
         # Inject reply context when user replies to a message not in history.

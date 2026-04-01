@@ -19,6 +19,8 @@ from typing import Any
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
 
+from hermes_constants import get_hermes_home
+
 
 # ---------------------------------------------------------------------------
 # CommandDef dataclass
@@ -276,7 +278,7 @@ def _resolve_config_gates() -> set[str]:
     """Return canonical names of commands whose ``gateway_config_gate`` is truthy.
 
     Reads ``config.yaml`` and walks the dot-separated key path for each
-    config-gated command.  Returns an empty set on any error so callers
+    config-gated command. Returns an empty set on any error so callers
     degrade gracefully.
     """
     gated = [c for c in COMMAND_REGISTRY if c.gateway_config_gate]
@@ -284,11 +286,9 @@ def _resolve_config_gates() -> set[str]:
         return set()
     try:
         import yaml
-        config_path = os.path.join(
-            os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")),
-            "config.yaml",
-        )
-        if os.path.exists(config_path):
+
+        config_path = get_hermes_home() / "config.yaml"
+        if config_path.exists():
             with open(config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
         else:
@@ -307,6 +307,44 @@ def _resolve_config_gates() -> set[str]:
         if val:
             result.add(cmd.name)
     return result
+
+
+def _quick_command_telegram_menu_entries() -> list[tuple[str, str]]:
+    """Return Telegram menu entries for configured quick commands.
+
+    Telegram's command menu only advertises commands explicitly registered via
+    ``setMyCommands``. Quick commands are resolved at dispatch time, so without
+    mirroring them here Telegram users cannot discover shortcuts like
+    ``/ccinspect`` from the in-app slash menu.
+    """
+    try:
+        from gateway.config import load_gateway_config
+
+        gateway_config = load_gateway_config()
+    except Exception:
+        return []
+
+    quick_commands = getattr(gateway_config, "quick_commands", {}) or {}
+    if not isinstance(quick_commands, dict):
+        return []
+
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_name, raw_spec in quick_commands.items():
+        name = str(raw_name).strip().lstrip("/").replace("-", "_")
+        if not name or name in seen:
+            continue
+
+        spec = raw_spec if isinstance(raw_spec, dict) else {}
+        qtype = str(spec.get("type") or "").strip()
+        if qtype and qtype != "exec":
+            continue
+
+        description = str(spec.get("description") or "Run quick command").strip() or "Run quick command"
+        entries.append((name, description[:256]))
+        seen.add(name)
+
+    return entries
 
 
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
@@ -348,16 +386,26 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     """Return (command_name, description) pairs for Telegram setMyCommands.
 
     Telegram command names cannot contain hyphens, so they are replaced with
-    underscores.  Aliases are skipped -- Telegram shows one menu entry per
-    canonical command.
+    underscores. Aliases are skipped -- Telegram shows one menu entry per
+    canonical command. Configured quick commands are appended so the Telegram
+    slash menu can advertise runtime shortcuts like ``/ccinspect``.
     """
     overrides = _resolve_config_gates()
     result: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
         tg_name = cmd.name.replace("-", "_")
         result.append((tg_name, cmd.description))
+        seen.add(tg_name)
+
+    for tg_name, description in _quick_command_telegram_menu_entries():
+        if tg_name in seen:
+            continue
+        result.append((tg_name, description))
+        seen.add(tg_name)
+
     return result
 
 

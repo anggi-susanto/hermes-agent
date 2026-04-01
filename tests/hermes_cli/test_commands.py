@@ -202,6 +202,49 @@ class TestTelegramBotCommands:
                 tg_name = cmd.name.replace("-", "_")
                 assert tg_name not in names
 
+    def test_includes_exec_quick_commands_from_config_yaml(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "quick_commands:\n"
+            "  ccinspect:\n"
+            "    type: exec\n"
+            "    command: echo inspect\n"
+            "    description: Inspect CentraCast runtime\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        commands = dict(telegram_bot_commands())
+        assert commands["ccinspect"] == "Inspect CentraCast runtime"
+
+    def test_quick_commands_fallback_description_and_name_normalization(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "quick_commands:\n"
+            "  cc-run:\n"
+            "    type: exec\n"
+            "    command: echo run\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        commands = dict(telegram_bot_commands())
+        assert commands["cc_run"] == "Run quick command"
+
+    def test_skips_non_exec_quick_commands_in_telegram_menu(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "quick_commands:\n"
+            "  ccinspect:\n"
+            "    type: alias\n"
+            "    target: /help\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        commands = dict(telegram_bot_commands())
+        assert "ccinspect" not in commands
+
 
 class TestSlackSubcommandMap:
     def test_returns_dict(self):

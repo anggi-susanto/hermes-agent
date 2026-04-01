@@ -72,6 +72,14 @@ def _ensure_ssl_certs() -> None:
 
 _ensure_ssl_certs()
 
+
+def _render_quick_exec_command(template: str, user_args: str) -> str:
+    """Render a quick-command exec template with optional argument placeholders."""
+    return template.format(
+        args=shlex.quote(user_args),
+        args_raw=user_args,
+    )
+
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -1916,9 +1924,11 @@ class GatewayRunner:
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        user_args = event.get_command_args().strip()
+                        rendered_cmd = _render_quick_exec_command(exec_cmd, user_args)
                         try:
                             proc = await asyncio.create_subprocess_shell(
-                                exec_cmd,
+                                rendered_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                             )

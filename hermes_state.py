@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -85,10 +85,77 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_reasoning_items TEXT
 );
 
+CREATE TABLE IF NOT EXISTS board_connections (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    company_id TEXT,
+    company_slug TEXT,
+    company_name TEXT,
+    auth_mode TEXT,
+    credential_ref TEXT,
+    provider_user_id TEXT,
+    provider_user_name TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    raw TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_synced_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS board_items (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL REFERENCES board_connections(id) ON DELETE CASCADE,
+    item_type TEXT NOT NULL,
+    remote_item_id TEXT NOT NULL,
+    parent_remote_item_id TEXT,
+    title TEXT,
+    status TEXT,
+    remote_updated_at TEXT,
+    payload TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(connection_id, item_type, remote_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS board_links (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    connection_id TEXT NOT NULL REFERENCES board_connections(id) ON DELETE CASCADE,
+    item_id TEXT NOT NULL REFERENCES board_items(id) ON DELETE CASCADE,
+    remote_item_id TEXT,
+    item_type TEXT NOT NULL,
+    relationship TEXT,
+    metadata TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(session_id, connection_id, item_id, relationship)
+);
+
+CREATE TABLE IF NOT EXISTS board_sync_events (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL REFERENCES board_connections(id) ON DELETE CASCADE,
+    session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    operation TEXT,
+    item_type TEXT,
+    remote_item_id TEXT,
+    status TEXT,
+    cursor TEXT,
+    detail TEXT,
+    created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_board_items_connection_id ON board_items(connection_id);
+CREATE INDEX IF NOT EXISTS idx_board_items_connection_type_remote ON board_items(connection_id, item_type, remote_item_id);
+CREATE INDEX IF NOT EXISTS idx_board_links_session_id ON board_links(session_id);
+CREATE INDEX IF NOT EXISTS idx_board_links_connection_id ON board_links(connection_id);
+CREATE INDEX IF NOT EXISTS idx_board_sync_events_connection_id ON board_sync_events(connection_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_board_sync_events_session_id ON board_sync_events(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_board_sync_events_item_type ON board_sync_events(item_type, remote_item_id);
 """
 
 FTS_SQL = """
@@ -330,6 +397,82 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                cursor.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS board_connections (
+                        id TEXT PRIMARY KEY,
+                        provider TEXT NOT NULL,
+                        company_id TEXT,
+                        company_slug TEXT,
+                        company_name TEXT,
+                        auth_mode TEXT,
+                        credential_ref TEXT,
+                        provider_user_id TEXT,
+                        provider_user_name TEXT,
+                        is_active INTEGER NOT NULL DEFAULT 1,
+                        raw TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        last_synced_at TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS board_items (
+                        id TEXT PRIMARY KEY,
+                        connection_id TEXT NOT NULL REFERENCES board_connections(id) ON DELETE CASCADE,
+                        item_type TEXT NOT NULL,
+                        remote_item_id TEXT NOT NULL,
+                        parent_remote_item_id TEXT,
+                        title TEXT,
+                        status TEXT,
+                        remote_updated_at TEXT,
+                        payload TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        UNIQUE(connection_id, item_type, remote_item_id)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS board_links (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        connection_id TEXT NOT NULL REFERENCES board_connections(id) ON DELETE CASCADE,
+                        item_id TEXT NOT NULL REFERENCES board_items(id) ON DELETE CASCADE,
+                        remote_item_id TEXT,
+                        item_type TEXT NOT NULL,
+                        relationship TEXT,
+                        metadata TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        UNIQUE(session_id, connection_id, item_id, relationship)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS board_sync_events (
+                        id TEXT PRIMARY KEY,
+                        connection_id TEXT NOT NULL REFERENCES board_connections(id) ON DELETE CASCADE,
+                        session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                        event_type TEXT NOT NULL,
+                        operation TEXT,
+                        item_type TEXT,
+                        remote_item_id TEXT,
+                        status TEXT,
+                        cursor TEXT,
+                        detail TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    """
+                )
+                cursor.executescript(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_board_items_connection_id ON board_items(connection_id);
+                    CREATE INDEX IF NOT EXISTS idx_board_items_connection_type_remote ON board_items(connection_id, item_type, remote_item_id);
+                    CREATE INDEX IF NOT EXISTS idx_board_links_session_id ON board_links(session_id);
+                    CREATE INDEX IF NOT EXISTS idx_board_links_connection_id ON board_links(connection_id);
+                    CREATE INDEX IF NOT EXISTS idx_board_sync_events_connection_id ON board_sync_events(connection_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_board_sync_events_session_id ON board_sync_events(session_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_board_sync_events_item_type ON board_sync_events(item_type, remote_item_id);
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -594,6 +737,19 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    @staticmethod
+    def _json_dumps(value: Any) -> Optional[str]:
+        return json.dumps(value) if value is not None else None
+
+    @staticmethod
+    def _json_loads(value: Any) -> Any:
+        if value in (None, ""):
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         with self._lock:
@@ -602,6 +758,266 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def upsert_board_connection(
+        self,
+        connection_id: str,
+        provider: str,
+        company_id: str | None = None,
+        company_slug: str | None = None,
+        company_name: str | None = None,
+        auth_mode: str | None = None,
+        credential_ref: str | None = None,
+        provider_user_id: str | None = None,
+        provider_user_name: str | None = None,
+        is_active: bool = True,
+        raw: Any = None,
+        last_synced_at: str | None = None,
+    ) -> str:
+        now = time.time()
+        raw_json = self._json_dumps(raw)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO board_connections (
+                    id, provider, company_id, company_slug, company_name,
+                    auth_mode, credential_ref, provider_user_id, provider_user_name,
+                    is_active, raw, created_at, updated_at, last_synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    provider = excluded.provider,
+                    company_id = excluded.company_id,
+                    company_slug = excluded.company_slug,
+                    company_name = excluded.company_name,
+                    auth_mode = excluded.auth_mode,
+                    credential_ref = excluded.credential_ref,
+                    provider_user_id = excluded.provider_user_id,
+                    provider_user_name = excluded.provider_user_name,
+                    is_active = excluded.is_active,
+                    raw = excluded.raw,
+                    updated_at = excluded.updated_at,
+                    last_synced_at = excluded.last_synced_at
+                """,
+                (
+                    connection_id,
+                    provider,
+                    company_id,
+                    company_slug,
+                    company_name,
+                    auth_mode,
+                    credential_ref,
+                    provider_user_id,
+                    provider_user_name,
+                    1 if is_active else 0,
+                    raw_json,
+                    now,
+                    now,
+                    last_synced_at,
+                ),
+            )
+            return connection_id
+
+        return self._execute_write(_do)
+
+    def get_board_connection(self, connection_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM board_connections WHERE id = ?",
+                (connection_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["is_active"] = bool(result["is_active"])
+        result["raw"] = self._json_loads(result.get("raw"))
+        return result
+
+    def upsert_board_item(
+        self,
+        item_id: str,
+        connection_id: str,
+        item_type: str,
+        remote_item_id: str,
+        parent_remote_item_id: str | None = None,
+        title: str | None = None,
+        status: str | None = None,
+        remote_updated_at: str | None = None,
+        payload: Any = None,
+    ) -> str:
+        now = time.time()
+        payload_json = self._json_dumps(payload)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO board_items (
+                    id, connection_id, item_type, remote_item_id, parent_remote_item_id,
+                    title, status, remote_updated_at, payload, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    connection_id = excluded.connection_id,
+                    item_type = excluded.item_type,
+                    remote_item_id = excluded.remote_item_id,
+                    parent_remote_item_id = excluded.parent_remote_item_id,
+                    title = excluded.title,
+                    status = excluded.status,
+                    remote_updated_at = excluded.remote_updated_at,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    item_id,
+                    connection_id,
+                    item_type,
+                    remote_item_id,
+                    parent_remote_item_id,
+                    title,
+                    status,
+                    remote_updated_at,
+                    payload_json,
+                    now,
+                    now,
+                ),
+            )
+            return item_id
+
+        return self._execute_write(_do)
+
+    def link_session_to_board_item(
+        self,
+        link_id: str,
+        session_id: str,
+        connection_id: str,
+        item_id: str,
+        remote_item_id: str | None,
+        item_type: str,
+        relationship: str | None = None,
+        metadata: Any = None,
+    ) -> str:
+        now = time.time()
+        metadata_json = self._json_dumps(metadata)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO board_links (
+                    id, session_id, connection_id, item_id, remote_item_id,
+                    item_type, relationship, metadata, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    connection_id = excluded.connection_id,
+                    item_id = excluded.item_id,
+                    remote_item_id = excluded.remote_item_id,
+                    item_type = excluded.item_type,
+                    relationship = excluded.relationship,
+                    metadata = excluded.metadata,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    link_id,
+                    session_id,
+                    connection_id,
+                    item_id,
+                    remote_item_id,
+                    item_type,
+                    relationship,
+                    metadata_json,
+                    now,
+                    now,
+                ),
+            )
+            return link_id
+
+        return self._execute_write(_do)
+
+    def list_board_links_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM board_links WHERE session_id = ? ORDER BY created_at, id",
+                (session_id,),
+            ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = self._json_loads(item.get("metadata"))
+            results.append(item)
+        return results
+
+    def record_board_sync_event(
+        self,
+        event_id: str,
+        connection_id: str,
+        session_id: str | None,
+        event_type: str,
+        operation: str | None = None,
+        item_type: str | None = None,
+        remote_item_id: str | None = None,
+        status: str | None = None,
+        cursor: str | None = None,
+        detail: Any = None,
+    ) -> str:
+        detail_json = self._json_dumps(detail)
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO board_sync_events (
+                    id, connection_id, session_id, event_type, operation,
+                    item_type, remote_item_id, status, cursor, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    connection_id = excluded.connection_id,
+                    session_id = excluded.session_id,
+                    event_type = excluded.event_type,
+                    operation = excluded.operation,
+                    item_type = excluded.item_type,
+                    remote_item_id = excluded.remote_item_id,
+                    status = excluded.status,
+                    cursor = excluded.cursor,
+                    detail = excluded.detail
+                """,
+                (
+                    event_id,
+                    connection_id,
+                    session_id,
+                    event_type,
+                    operation,
+                    item_type,
+                    remote_item_id,
+                    status,
+                    cursor,
+                    detail_json,
+                    now,
+                ),
+            )
+            return event_id
+
+        return self._execute_write(_do)
+
+    def list_board_sync_events(
+        self,
+        connection_id: str,
+        limit: int = 50,
+        session_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        params: list[Any] = [connection_id]
+        sql = "SELECT * FROM board_sync_events WHERE connection_id = ?"
+        if session_id is not None:
+            sql += " AND session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = self._json_loads(item.get("detail"))
+            results.append(item)
+        return results
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.

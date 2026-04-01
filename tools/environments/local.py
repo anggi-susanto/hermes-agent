@@ -49,6 +49,13 @@ def _build_provider_env_blocklist() -> frozenset:
         pass
 
     try:
+        from hermes_cli.board_auth import BOARD_PROVIDER_REGISTRY
+        for pconfig in BOARD_PROVIDER_REGISTRY.values():
+            blocked.update(pconfig.api_key_env_vars)
+    except ImportError:
+        pass
+
+    try:
         from hermes_cli.config import OPTIONAL_ENV_VARS
         for name, metadata in OPTIONAL_ENV_VARS.items():
             category = metadata.get("category")

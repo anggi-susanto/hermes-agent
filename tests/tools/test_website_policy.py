@@ -242,7 +242,8 @@ def test_load_website_blocklist_wraps_shared_file_read_errors(tmp_path, monkeypa
 def test_check_website_access_uses_dynamic_hermes_home(monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
-    (hermes_home / "config.yaml").write_text(
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
         yaml.safe_dump(
             {
                 "security": {
@@ -259,7 +260,7 @@ def test_check_website_access_uses_dynamic_hermes_home(monkeypatch, tmp_path):
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    blocked = check_website_access("https://dynamic.example/path")
+    blocked = check_website_access("https://dynamic.example/path", config_path=config_path)
 
     assert blocked is not None
     assert blocked["rule"] == "dynamic.example"

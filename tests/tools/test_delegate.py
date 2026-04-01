@@ -593,9 +593,15 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "model": "qwen2.5-coder",
             "base_url": "http://localhost:1234/v1",
         }
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "env-openrouter-key"}, clear=False):
-            with self.assertRaises(ValueError) as ctx:
-                _resolve_delegation_credentials(cfg, parent)
+        with patch.dict(
+            os.environ,
+            {"OPENROUTER_API_KEY": "env-openrouter-key"},
+            clear=False,
+        ):
+            with patch.dict(os.environ, {}, clear=True):
+                os.environ["OPENROUTER_API_KEY"] = "env-openrouter-key"
+                with self.assertRaises(ValueError) as ctx:
+                    _resolve_delegation_credentials(cfg, parent)
         self.assertIn("OPENAI_API_KEY", str(ctx.exception))
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")

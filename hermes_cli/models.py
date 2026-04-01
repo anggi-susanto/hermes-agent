@@ -480,6 +480,14 @@ def detect_provider_for_model(
     if any(name_lower == m.lower() for m in current_models):
         return None
 
+    # Prefer canonical OpenRouter slugs for provider-less model names when we can
+    # resolve them unambiguously. This keeps `/model claude-opus-4.6` stable even
+    # when direct-provider credentials (e.g. Copilot) are present in the env.
+    if "/" not in name:
+        or_slug = _find_openrouter_slug(name)
+        if or_slug and current_provider != "openrouter":
+            return ("openrouter", or_slug)
+
     # --- Step 1: check static provider catalogs for a direct match ---
     direct_match: Optional[str] = None
     for pid, models in _PROVIDER_MODELS.items():

@@ -15,6 +15,7 @@ Usage:
 
 import logging
 import os
+import shlex
 import shutil
 import sys
 import json
@@ -29,6 +30,14 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _render_quick_exec_command(template: str, user_args: str) -> str:
+    """Render a quick-command exec template with optional argument placeholders."""
+    return template.format(
+        args=shlex.quote(user_args),
+        args_raw=user_args,
+    )
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -3869,9 +3878,11 @@ class HermesCLI:
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        user_args = cmd_original[len(base_cmd):].strip()
+                        rendered_cmd = _render_quick_exec_command(exec_cmd, user_args)
                         try:
                             result = subprocess.run(
-                                exec_cmd, shell=True, capture_output=True,
+                                rendered_cmd, shell=True, capture_output=True,
                                 text=True, timeout=30
                             )
                             output = result.stdout.strip() or result.stderr.strip()

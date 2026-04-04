@@ -101,6 +101,11 @@ try:
         _MCP_HTTP_AVAILABLE = True
     except ImportError:
         _MCP_HTTP_AVAILABLE = False
+    try:
+        from mcp.client.sse import sse_client
+        _MCP_SSE_AVAILABLE = True
+    except ImportError:
+        _MCP_SSE_AVAILABLE = False
     # Prefer the non-deprecated API (mcp >= 1.24.0); fall back to the
     # deprecated wrapper for older SDK versions.
     try:
@@ -749,8 +754,14 @@ class MCPServerTask:
         self._refresh_lock = asyncio.Lock()
 
     def _is_http(self) -> bool:
-        """Check if this server uses HTTP transport."""
+        """Check if this server uses HTTP-family transport."""
         return "url" in self._config
+
+    def _is_sse(self) -> bool:
+        """Check if this server should use legacy SSE transport."""
+        transport = str(self._config.get("transport", "")).lower().strip()
+        url = str(self._config.get("url", "")).strip()
+        return transport == "sse" or url.endswith("/sse")
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
@@ -920,6 +931,27 @@ class MCPServerTask:
                     self._ready.set()
                     await self._shutdown_event.wait()
 
+    async def _run_sse(self, config: dict):
+        """Run the server using legacy SSE transport."""
+        if not _MCP_SSE_AVAILABLE:
+            raise ImportError(
+                f"MCP server '{self.name}' requires SSE transport but "
+                "mcp.client.sse is not available. Upgrade the mcp package to get SSE support."
+            )
+
+        url = config["url"]
+        sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
+        if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
+            sampling_kwargs["message_handler"] = self._make_message_handler()
+
+        async with sse_client(url) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                await session.initialize()
+                self.session = session
+                await self._discover_tools()
+                self._ready.set()
+                await self._shutdown_event.wait()
+
     async def _discover_tools(self):
         """Discover tools from the connected session."""
         if self.session is None:
@@ -961,7 +993,9 @@ class MCPServerTask:
 
         while True:
             try:
-                if self._is_http():
+                if self._is_sse():
+                    await self._run_sse(config)
+                elif self._is_http():
                     await self._run_http(config)
                 else:
                     await self._run_stdio(config)

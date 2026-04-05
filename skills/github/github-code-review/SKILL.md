@@ -478,3 +478,38 @@ git branch -D pr-$PR_NUMBER
 - **Approve** — no critical or warning-level issues, only minor suggestions or all clear
 - **Request Changes** — any critical or warning-level issue that should be fixed before merge
 - **Comment** — observations and suggestions, but nothing blocking (use when you're unsure or the PR is a draft)
+
+### Important GitHub limitation: reviewing your own PR
+
+If you're authenticated as the same GitHub account that opened the PR, GitHub will reject formal `REQUEST_CHANGES` reviews. Typical error:
+
+```text
+GraphQL: Review Can not request changes on your own pull request
+```
+
+Fallback behavior:
+
+1. Still do the full review normally.
+2. Try the formal review only if you are not the PR author.
+3. If you are the PR author, post a top-level PR comment instead with:
+   - current verdict (`still blocked`, `would request changes`, etc.)
+   - exact checks/tests you ran
+   - concrete blocking findings
+   - clear criteria for what would unblock approval
+
+Do not silently downgrade the substance of the review just because GitHub disallows the formal review event.
+
+### Portability check for fixture/artifact-driven PRs
+
+When a PR claims to improve persisted artifact consumption, replay, inspect, or compare flows, explicitly verify that shipped fixtures are portable from a fresh checkout/worktree:
+
+```bash
+npm test -- --test-name-pattern='replay|inspect|compare|artifact'
+```
+
+Then inspect whether serialized fixture paths are absolute and machine-local (for example `/home/...`) instead of bundle-portable relative paths. A common failure mode is:
+- manifests serialize absolute `files.*` paths from the author's machine
+- replay code reads those paths directly
+- tests pass only on the author's machine, but fail in another checkout/worktree with `artifact payload unavailable` / `n/a`
+
+If you see that pattern, call it out as a contract portability issue, not just a fixture nuisance.

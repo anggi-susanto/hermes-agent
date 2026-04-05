@@ -294,6 +294,55 @@ Edit with `hermes config edit` or `hermes config set KEY VALUE`.
 - Gateway: /reset for tool changes, /restart for config changes
 - CLI: start a new session
 
+### Telegram sends duplicate / repeated replies
+If Hermes seems to answer the same Telegram message multiple times, audit these in order:
+
+1. **Check for multiple gateway instances**
+   ```bash
+   ps -ef | grep -E '[h]ermes_cli.main gateway run|[p]ython -m hermes_cli.main gateway run'
+   systemctl --user status hermes-gateway.service --no-pager -n 40
+   ```
+   A second poller can trigger Telegram 409 conflicts and confusing re-delivery behavior.
+
+2. **Inspect gateway logs for Telegram timeouts/conflicts**
+   ```bash
+   journalctl --user -u hermes-gateway.service --since '1 hour ago' --no-pager
+   tail -n 200 ~/.hermes/logs/gateway.log
+   tail -n 200 ~/.hermes/logs/errors.log
+   ```
+   Important signals:
+   - `telegram.error.TimedOut`
+   - polling conflict / reconnect warnings
+   - repeated handling of the same inbound message
+
+3. **Audit the Telegram adapter reconnect policy**
+   In `gateway/platforms/telegram.py`, check whether initial polling and reconnect paths use different `drop_pending_updates` values.
+   A risky pattern is:
+   - initial `start_polling(..., drop_pending_updates=True)`
+   - reconnect retry `start_polling(..., drop_pending_updates=False)`
+
+   That can replay pending updates after a network flap or poller conflict.
+
+4. **Confirm inbound dedup exists**
+   The safest fix is adapter-level dedup keyed by Telegram `update_id` (or a fallback like `chat_id + message_id` with TTL).
+   Without dedup, replayed/pending updates can cause the same user prompt to be processed more than once.
+
+5. **Treat send timeouts as ambiguous delivery**
+   A timeout during `send_message` does **not** prove Telegram failed to deliver. The message may already be visible to the user, so automatic retries or replayed agent runs can create duplicates.
+
+Recommended remediation order:
+- verify whether reconnect/retry polling paths are re-consuming backlog because `drop_pending_updates=False`
+- if losing a tiny backlog on reconnect is acceptable, set reconnect/retry polling to `drop_pending_updates=True`
+- add inbound dedup for Telegram updates/messages (practical fallback: `chat_id:message_id` with a TTL cache if `update_id` is awkward to plumb through handlers)
+- add forensic logging (`update_id`, `chat_id`, `message_id`, session key, dedup hit/miss)
+- optionally add outbound idempotency guards for identical responses within a short TTL window
+
+Practical fix that proved effective in Hermes:
+- change Telegram polling reconnect/conflict-retry `start_polling(...)` calls to `drop_pending_updates=True`, not just the cold start path
+- add adapter-level inbound dedup before dispatching text/command/location/media handlers
+- make dedup TTL configurable, e.g. `HERMES_TELEGRAM_INBOUND_DEDUP_TTL_SECONDS=300`
+- add regression tests asserting reconnect retries use `drop_pending_updates=True` and duplicate inbound `chat_id:message_id` is ignored
+
 ### Skills not showing up
 1. Check `hermes skills list` shows the skill
 2. Check `hermes skills config` has it enabled for your platform

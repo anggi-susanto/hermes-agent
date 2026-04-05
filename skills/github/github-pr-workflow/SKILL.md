@@ -19,6 +19,37 @@ Complete guide for managing the PR lifecycle. Each section shows the `gh` way fi
 - Authenticated with GitHub (see `github-auth` skill)
 - Inside a git repository with a GitHub remote
 
+### Preflight Checklist (do this before branch/PR work)
+
+1. Confirm current branch and cleanliness:
+```bash
+git status --short --branch
+```
+2. Check whether the requested branch already exists locally or remotely:
+```bash
+git branch --list staging
+git branch -r --list origin/staging
+```
+3. Confirm the branch actually has work to publish:
+```bash
+git log --oneline main..HEAD
+```
+4. If the repo is on `main` and clean, there may be nothing to push. Before starting any new work, check whether the requested commit/push already happened:
+```bash
+git log --oneline -5 --decorate
+git diff --stat origin/$(git branch --show-current)...HEAD
+git status --short
+```
+- If `HEAD` is already at `origin/<branch>` and the working tree is clean, report "already committed and pushed" instead of inventing new changes or switching to a different task.
+- This is especially important when the user says a short imperative like `commit push` after a previous task; interpret it as "publish the current results", not "start the next planned item".
+5. If the user asks for a specific branch name like `staging`, verify whether that branch exists and contains commits before attempting PR creation.
+6. Confirm the exact repository path before running git commands. In this environment, user-provided paths may be off by a small directory-name mismatch (for example `workspace` vs `workspaces`). Use `pwd`, `git rev-parse --show-toplevel`, and a filesystem search if needed.
+7. If `git checkout <branch>` emits a warning about “leaving 1 commit behind” from detached HEAD, note the commit hash and only create a rescue branch if the user wants to preserve it; otherwise proceed with the requested branch checkout.
+8. Do not let an old todo list or previously proposed next steps override the user's latest command. For terse commands like `commit push`, re-anchor on the newest user intent, then verify git reality before acting.
+
+This avoids trying to create a PR from a branch that either doesn’t exist or has no diff against the base branch, and it helps recover cleanly from detached-HEAD workspace states.
+
+
 ### Quick Auth Detection
 
 ```bash
@@ -29,11 +60,7 @@ else
   AUTH="git"
   # Ensure we have a token for API calls
   if [ -z "$GITHUB_TOKEN" ]; then
-    if [ -f ~/.hermes/.env ] && grep -q "^GITHUB_TOKEN=" ~/.hermes/.env; then
-      GITHUB_TOKEN=$(grep "^GITHUB_TOKEN=" ~/.hermes/.env | head -1 | cut -d= -f2 | tr -d '\n\r')
-    elif grep -q "github.com" ~/.git-credentials 2>/dev/null; then
-      GITHUB_TOKEN=$(grep "github.com" ~/.git-credentials 2>/dev/null | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|')
-    fi
+    GITHUB_TOKEN=$(grep "github.com" ~/.git-credentials 2>/dev/null | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|')
   fi
 fi
 echo "Using: $AUTH"
@@ -101,6 +128,25 @@ Longer explanation if needed. Wrap at 72 characters.
 Types: `feat`, `fix`, `refactor`, `docs`, `test`, `ci`, `chore`, `perf`
 
 ## 3. Pushing and Creating a PR
+
+### Post-commit verification before push
+
+Before pushing, verify the commit actually contains the files you think it contains. This matters when the repo had pre-existing dirty state, when you reported a planned file list earlier in the conversation, or when some files were already committed separately.
+
+Run:
+
+```bash
+git status --short
+git show --stat --name-status --oneline -1
+```
+
+Checklist:
+- confirm the latest commit hash and message are the one you intend to publish
+- confirm the file list in `git show` matches the user-facing summary you are about to give
+- if a file is still dirty after commit, it was not included; do not claim it was pushed
+- if a file you expected is missing from `git show`, stop and fix the staging/commit set before pushing
+
+This avoids a common failure mode: the assistant says "README + docs were pushed" when the commit actually only contained the docs files.
 
 ### Push the Branch (same either way)
 

@@ -140,6 +140,10 @@ Read and understand:
 
 ### Step 2: Explore the Codebase
 
+For doc-only planning requests, keep exploration read-only. Do not create scaffolding, placeholder modules, or speculative code while gathering context for the plan. If you need example file names or contracts, infer them from existing docs/code and write them only into the plan document until the user explicitly asks for implementation.
+
+Before writing the plan, check whether a draft plan file already exists and read it first so you update/replace intentionally instead of blindly overwriting. After finishing a doc-only task, verify `git status --short` to ensure only the expected documentation files changed.
+
 Use Hermes tools to understand the project:
 
 ```python
@@ -269,6 +273,77 @@ git commit -m "type: description"
 **Bad:** "Create the model file"
 **Good:** "Create: `src/models/user.py`"
 
+## Delegation Plans for CEOs / Manager Agents
+
+When the user wants a task package for a CEO, Paperclip, or another manager agent who will delegate to child agents, switch from implementation-only planning to an anti-ambiguity delegation pack.
+
+Add these sections explicitly:
+- **Mission** — one paragraph stating the real objective and what counts as success
+- **Workstreams / Lanes** — split the work by repo, domain, or subsystem
+- **Task packs** — one pack per child agent with clear scope boundaries
+- **Subtasks** — concrete review or implementation checkpoints under each pack
+- **Required deliverables** — exact artifacts each child must return
+- **Definition of done** — how the manager knows the pack is actually complete
+- **Anti-bullshit section** — what could not be verified, what is docs-only, what may be stale, and where evidence is missing
+- **Rubric / scorecard** — how to grade outputs consistently across children
+
+For review/audit delegation, require every child pack to include:
+- Scope
+- Objective
+- Evidence expectations (file paths, routes, tests, branch context, commands)
+- Findings table fields: finding, evidence, why it matters, severity, suggested owner
+- Recommended action fields: title, repo, done when, blocked by, unlocks, proof required
+
+For multi-repo ecosystems, also require an **integrator/mandor lane** whose only job is to reconcile outputs across children into:
+- ownership matrix
+- contract gap matrix
+- dependency-ordered backlog
+- docs-ahead-of-code vs code-ahead-of-docs list
+
+If the user is not asking for net-new architecture but for the next execution step after a design package is already frozen, first do a gap assessment before writing the delegation pack:
+- inspect the current repo/package state
+- separate **already decided** vs **still missing**
+- identify whether the bottleneck is architecture, implementation sequencing, staffing, proof, or rollout
+- avoid reopening settled scope; treat prior approved boundaries as hard constraints
+
+For this execution-launch style plan, explicitly include:
+- **Current state assessment** — what is done vs missing
+- **Staffing model** — owner, reviewer, outputs, and non-ownership per role
+- **Parallel lane plan** — what can run concurrently without semantic drift
+- **Sequencing rules** — what must wait for interface freeze or partial outputs
+- **First shippable milestone** — code-based, not prose-based
+- **Acceptance proof requirements** — what evidence proves implementation actually started/completed
+- **Parallel execution risk register** — drift controls for multi-lane work
+
+### Tracker mode for anchor / re-anchor-safe execution
+
+When the user wants an issue-ready tracker that can survive partial delivery, handoffs, or future re-scoping, don't write only a linear implementation plan. Write a tracker document with durable anchors and explicit re-anchor rules.
+
+Include all of these:
+- **Stable anchor IDs** for each top-level slice (e.g. `ABC-001`, `ABC-002`)
+- **Child split convention** for follow-up work (e.g. `ABC-002.A`, `ABC-002.B`)
+- **Status vocabulary** with a closed set (`Pending`, `In Progress`, `Partial`, `Blocked`, `Done`, `Split`, `Dropped`)
+- **Dependency map** showing what must land first and what can run in parallel
+- **Master tracker table** with anchor, title, status, dependencies, owner lane, and why it matters
+- **Acceptance proof** per anchor so `Done` means evidence-backed, not vibes-backed
+- **Anti-bullshit notes** per anchor defining what does *not* count as done
+- **Re-anchor checklist** for updating status, proof, remaining gaps, and child anchors after partial work
+- **Reviewer checklist** so future reviewers can reject fake completion consistently
+
+Rules to state explicitly in tracker mode:
+1. Preserve anchor IDs even if wording changes.
+2. Never silently delete a parent item after splitting; mark it `Split` and link children.
+3. Do not mark work `Done` just because code exists; require tests/verification/docs if the contract changed.
+4. Prefer issue-ready slices with `Problem`, `Objective`, `Scope`, `Dependencies`, `Deliverables`, `Acceptance proof`, and `Anti-bullshit notes` headings.
+
+Use tracker mode especially when the user says things like:
+- "issue ready"
+- "trackable"
+- "anchor / re-anchor"
+- "safe for handoff"
+- "resume later without drift"
+
+Use this style when the user explicitly wants a 'super complete' delegation package that leaves little room for child-agent interpretation drift.
 ## Execution Handoff
 
 After saving the plan, offer the execution approach:

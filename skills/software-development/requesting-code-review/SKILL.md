@@ -75,6 +75,18 @@ git diff --stat HEAD~1
 git log --oneline -5
 ```
 
+For CLI/helper refactors, also compare sibling entrypoints that are supposed to stay behaviorally aligned (for example: shell wrapper vs Node CLI vs TypeScript entrypoint vs README examples). Reviewers should explicitly look for contract drift where one path still sends different payload fields, defaults, or validation semantics than the others.
+
+For wrapper/parser migrations, do not stop at diff review or unit tests. The reviewer should run a few real CLI probes covering:
+- help output
+- the documented happy path
+- at least one failure/guard path
+- at least one ambiguous legacy invocation that could be misparsed
+
+This catches issues that tests often miss, such as shell wrappers that document stricter semantics than they enforce, positional arguments being interpreted as files instead of objectives, or flags being forwarded twice.
+
+If the first review finds issues and you fix them, run a second focused re-review before commit/push. Follow-up review often catches a smaller cleanup bug introduced or left behind during the first fix pass.
+
 ### Step 3: Dispatch Reviewer Subagent
 
 Use `delegate_task` to dispatch a focused reviewer:
@@ -161,6 +173,7 @@ delegate_task(
 - Do they cover edge cases?
 - Do they test behavior, not implementation?
 - Do all tests pass?
+- For smoke/harness scripts, do tests cover real execution semantics instead of only parser/helper alignment? Watch for placeholder IDs, dummy inputs, or mocked assumptions that make the script pass unit tests while failing in live mode.
 
 ### Security
 - Any injection vulnerabilities?

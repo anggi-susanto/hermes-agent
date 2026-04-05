@@ -347,6 +347,23 @@ Servers can also include `tools` in sampling requests for multi-turn tool-augmen
 
 Disable sampling for untrusted servers with `sampling: { enabled: false }`.
 
+## CLI Verification Pattern
+
+When you want to smoke-test a configured MCP server from the shell without opening an interactive chat, use the `hermes chat` subcommand with `-q/--query`.
+
+Example pattern:
+
+```bash
+hermes chat -Q --source tool -q "Use the postgres-centracast-staging MCP query tool to run this SQL exactly and return the raw result as JSON only: SELECT current_database(), current_user;"
+```
+
+Important pitfall:
+- `hermes chat -Q --source tool "..."` without `-q` fails because the prompt text is treated as an unexpected positional argument.
+- Use `hermes mcp test <server-name>` first to confirm connection and discovered tools, then use `hermes chat ... -q "..."` for real tool invocation.
+- Important pitfall: `hermes mcp test` only proves transport connectivity and tool discovery. It does NOT guarantee the downstream system credentials used by the tool are actually valid for a real operation. In practice, a database-backed MCP server can pass `hermes mcp test` and still fail on the first query with an auth error such as `password authentication failed`.
+- If a real MCP call fails after a successful `hermes mcp test`, explicitly separate the findings into: (1) MCP transport/discovery is healthy, and (2) the downstream integration or credentials are broken. Then pivot to alternative verification paths (for example, source inspection plus live HTTP/API checks) so diagnosis can continue while the MCP auth/config issue is fixed.
+- Quiet mode still may include some startup/log noise from other configured MCP servers, so inspect the final JSON payload in the output rather than assuming perfectly clean stdout.
+
 ## Notes
 
 - MCP tools are called synchronously from the agent's perspective but run asynchronously on a dedicated background event loop

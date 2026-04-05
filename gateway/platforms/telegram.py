@@ -19,10 +19,11 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import (
         Application,
         CommandHandler,
+        CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         filters,
@@ -35,8 +36,11 @@ except ImportError:
     Update = Any
     Bot = Any
     Message = Any
+    InlineKeyboardButton = Any
+    InlineKeyboardMarkup = Any
     Application = Any
     CommandHandler = Any
+    CallbackQueryHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -588,6 +592,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
+            # Handle inline keyboard button callbacks (update prompts)
+            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             
             # Start polling — retry initialize() for transient TLS resets
             try:
@@ -667,10 +673,19 @@ class TelegramAdapter(BasePlatformAdapter):
             # gateway command there automatically adds it to the Telegram menu.
             try:
                 from telegram import BotCommand
-                from hermes_cli.commands import telegram_bot_commands
+                from hermes_cli.commands import telegram_menu_commands
+                # Telegram allows up to 100 commands but has an undocumented
+                # payload size limit.  Skill descriptions are truncated to 40
+                # chars in telegram_menu_commands() to fit 100 commands safely.
+                menu_commands, hidden_count = telegram_menu_commands(max_commands=100)
                 await self._bot.set_my_commands([
-                    BotCommand(name, desc) for name, desc in telegram_bot_commands()
+                    BotCommand(name, desc) for name, desc in menu_commands
                 ])
+                if hidden_count:
+                    logger.info(
+                        "[%s] Telegram menu: %d commands registered, %d hidden (over 100 limit). Use /commands for full list.",
+                        self.name, len(menu_commands), hidden_count,
+                    )
             except Exception as e:
                 logger.warning(
                     "[%s] Could not register Telegram command menu: %s",
@@ -777,9 +792,14 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-
-        send_started_at = time.monotonic()
+        
+        # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
+        if not content or not content.strip():
+            return SendResult(success=True, message_id=None)
+        
         try:
+            send_started_at = time.monotonic()
+
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -839,6 +859,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 from telegram.error import BadRequest as _BadReq
             except ImportError:
                 _BadReq = None  # type: ignore[assignment,misc]
+
+            try:
+                from telegram.error import TimedOut as _TimedOut
+            except (ImportError, AttributeError):
+                _TimedOut = None  # type: ignore[assignment,misc]
 
             for i, chunk in enumerate(chunks):
                 should_thread = self._should_thread_reply(reply_to, i)
@@ -934,6 +959,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                 reply_to_id = None
                                 continue
                             raise
+                        # TimedOut is also a subclass of NetworkError but
+                        # indicates the request may have reached the server —
+                        # retrying risks duplicate message delivery.
+                        if _TimedOut and isinstance(send_err, _TimedOut):
+                            raise
                         if _send_attempt < 2:
                             wait = 2 ** _send_attempt
                             logger.warning(
@@ -985,8 +1015,13 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
         except Exception as e:
-            logger.error("[%s] Failed to send Telegram message chat_id=%s: %s", self.name, chat_id, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
+            # TimedOut means the request may have reached Telegram —
+            # mark as non-retryable so _send_with_retry() doesn't re-send.
+            _to = locals().get("_TimedOut")
+            err_str = str(e).lower()
+            is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
+            return SendResult(success=False, error=str(e), retryable=not is_timeout)
 
     async def edit_message(
         self,
@@ -1036,7 +1071,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # best-effort truncation
                 return SendResult(success=True, message_id=message_id)
-            # Flood control / RetryAfter — back off and retry once
+            # Flood control / RetryAfter — short waits are retried inline,
+            # long waits return a failure immediately so streaming can fall back
+            # to a normal final send instead of leaving a truncated partial.
             retry_after = getattr(e, "retry_after", None)
             if retry_after is not None or "retry after" in err_str:
                 wait = retry_after if retry_after else 1.0
@@ -1044,6 +1081,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Telegram flood control, waiting %.1fs",
                     self.name, wait,
                 )
+                if wait > 5.0:
+                    return SendResult(success=False, error=f"flood_control:{wait}")
                 await asyncio.sleep(wait)
                 try:
                     await self._bot.edit_message_text(
@@ -1066,6 +1105,72 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    async def send_update_prompt(
+        self, chat_id: str, prompt: str, default: str = "",
+        session_key: str = "",
+    ) -> SendResult:
+        """Send an inline-keyboard update prompt (Yes / No buttons).
+
+        Used by the gateway ``/update`` watcher when ``hermes update --gateway``
+        needs user input (stash restore, config migration).
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            default_hint = f" (default: {default})" if default else ""
+            text = f"⚕ *Update needs your input:*\n\n{prompt}{default_hint}"
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✓ Yes", callback_data="update_prompt:y"),
+                    InlineKeyboardButton("✗ No", callback_data="update_prompt:n"),
+                ]
+            ])
+            msg = await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    async def _handle_callback_query(
+        self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
+    ) -> None:
+        """Handle inline keyboard button clicks (update prompts)."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        data = query.data
+        if not data.startswith("update_prompt:"):
+            return
+        answer = data.split(":", 1)[1]  # "y" or "n"
+        await query.answer(text=f"Sent '{answer}' to the update process.")
+        # Edit the message to show the choice and remove buttons
+        label = "Yes" if answer == "y" else "No"
+        try:
+            await query.edit_message_text(
+                text=f"⚕ Update prompt answered: *{label}*",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=None,
+            )
+        except Exception:
+            pass  # non-fatal if edit fails
+        # Write the response file
+        try:
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+            response_path = home / ".update_response"
+            tmp = response_path.with_suffix(".tmp")
+            tmp.write_text(answer)
+            tmp.replace(response_path)
+            logger.info("Telegram update prompt answered '%s' by user %s",
+                        answer, getattr(query.from_user, "id", "unknown"))
+        except Exception as exc:
+            logger.error("Failed to write update response from callback: %s", exc)
 
     async def send_voice(
         self,
@@ -2264,6 +2369,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._cache_dm_topic_from_message(str(chat.id), thread_id_str, created_name)
                     if not chat_topic:
                         chat_topic = created_name
+
+        elif chat_type == "group" and thread_id_str:
+            # Group/supergroup forum topic skill binding via config.extra['group_topics']
+            group_topics_config: list = self.config.extra.get("group_topics", [])
+            for chat_entry in group_topics_config:
+                if str(chat_entry.get("chat_id", "")) == str(chat.id):
+                    for topic in chat_entry.get("topics", []):
+                        tid = topic.get("thread_id")
+                        if tid is not None and str(tid) == thread_id_str:
+                            chat_topic = topic.get("name")
+                            topic_skill = topic.get("skill")
+                            break
+                    break
 
         # Build source
         source = self.build_source(

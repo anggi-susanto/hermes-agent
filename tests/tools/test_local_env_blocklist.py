@@ -117,8 +117,8 @@ class TestProviderEnvBlocklist:
             "TELEGRAM_HOME_CHANNEL": "12345",
             "DISCORD_HOME_CHANNEL": "67890",
             "SLACK_APP_TOKEN": "xapp-secret",
-            "WHATSAPP_ALLOWED_USERS": "+15555550123",
-            "SIGNAL_ACCOUNT": "+15555550124",
+            "WHATSAPP_ALLOWED_USERS": "+155****0123",
+            "SIGNAL_ACCOUNT": "+155****0124",
             "HASS_TOKEN": "ha-secret",
             "EMAIL_PASSWORD": "email-secret",
             "FIRECRAWL_API_KEY": "fc-secret",
@@ -287,6 +287,10 @@ class TestBlocklistCoverage:
             "MODAL_TOKEN_SECRET",
             "DAYTONA_API_KEY",
         }
+        assert extras.issubset(_HERMES_PROVIDER_ENV_BLOCKLIST)
+
+    def test_board_provider_vars_are_in_blocklist(self):
+        extras = {"PAPERCLIP_API_KEY"}
         assert extras.issubset(_HERMES_PROVIDER_ENV_BLOCKLIST)
 
 

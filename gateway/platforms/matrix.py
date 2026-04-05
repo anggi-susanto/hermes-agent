@@ -5,18 +5,23 @@ matrix-nio Python SDK.  Supports optional end-to-end encryption (E2EE)
 when installed with ``pip install "matrix-nio[e2e]"``.
 
 Environment variables:
-    MATRIX_HOMESERVER       Homeserver URL (e.g. https://matrix.example.org)
-    MATRIX_ACCESS_TOKEN     Access token (preferred auth method)
-    MATRIX_USER_ID          Full user ID (@bot:server) — required for password login
-    MATRIX_PASSWORD         Password (alternative to access token)
-    MATRIX_ENCRYPTION       Set "true" to enable E2EE
-    MATRIX_ALLOWED_USERS    Comma-separated Matrix user IDs (@user:server)
-    MATRIX_HOME_ROOM        Room ID for cron/notification delivery
+    MATRIX_HOMESERVER           Homeserver URL (e.g. https://matrix.example.org)
+    MATRIX_ACCESS_TOKEN         Access token (preferred auth method)
+    MATRIX_USER_ID              Full user ID (@bot:server) — required for password login
+    MATRIX_PASSWORD             Password (alternative to access token)
+    MATRIX_ENCRYPTION           Set "true" to enable E2EE
+    MATRIX_ALLOWED_USERS        Comma-separated Matrix user IDs (@user:server)
+    MATRIX_HOME_ROOM            Room ID for cron/notification delivery
+    MATRIX_REQUIRE_MENTION      Require @mention in rooms (default: true)
+    MATRIX_FREE_RESPONSE_ROOMS  Comma-separated room IDs exempt from mention requirement
+    MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import logging
 import mimetypes
 import os
@@ -46,6 +51,14 @@ _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
+
+# E2EE key export file for persistence across restarts.
+_KEY_EXPORT_FILE = _STORE_DIR / "exported_keys.txt"
+_KEY_EXPORT_PASSPHRASE = "hermes-matrix-e2ee-keys"
+
+# Pending undecrypted events: cap and TTL for retry buffer.
+_MAX_PENDING_EVENTS = 100
+_PENDING_EVENT_TTL = 300  # seconds — stop retrying after 5 min
 
 
 def check_matrix_requirements() -> bool:
@@ -108,6 +121,14 @@ class MatrixAdapter(BasePlatformAdapter):
         from collections import deque
         self._processed_events: deque = deque(maxlen=1000)
         self._processed_events_set: set = set()
+
+        # Buffer for undecrypted events pending key receipt.
+        # Each entry: (room, event, timestamp)
+        self._pending_megolm: list = []
+
+        # Thread participation tracking (for require_mention bypass)
+        self._bot_participated_threads: set = self._load_participated_threads()
+        self._MAX_TRACKED_THREADS = 500
 
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""
@@ -230,6 +251,16 @@ class MatrixAdapter(BasePlatformAdapter):
                 logger.info("Matrix: E2EE crypto initialized")
             except Exception as exc:
                 logger.warning("Matrix: crypto init issue: %s", exc)
+
+            # Import previously exported Megolm keys (survives restarts).
+            if _KEY_EXPORT_FILE.exists():
+                try:
+                    await client.import_keys(
+                        str(_KEY_EXPORT_FILE), _KEY_EXPORT_PASSPHRASE,
+                    )
+                    logger.info("Matrix: imported Megolm keys from backup")
+                except Exception as exc:
+                    logger.debug("Matrix: could not import keys: %s", exc)
         elif self._encryption:
             logger.warning(
                 "Matrix: E2EE requested but crypto store is not loaded; "
@@ -283,6 +314,18 @@ class MatrixAdapter(BasePlatformAdapter):
                 await self._sync_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        # Export Megolm keys before closing so the next restart can decrypt
+        # events that used sessions from this run.
+        if self._client and self._encryption and getattr(self._client, "olm", None):
+            try:
+                _STORE_DIR.mkdir(parents=True, exist_ok=True)
+                await self._client.export_keys(
+                    str(_KEY_EXPORT_FILE), _KEY_EXPORT_PASSPHRASE,
+                )
+                logger.info("Matrix: exported Megolm keys for next restart")
+            except Exception as exc:
+                logger.debug("Matrix: could not export keys on disconnect: %s", exc)
 
         if self._client:
             await self._client.close()
@@ -512,8 +555,11 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Upload an audio file as a voice message."""
-        return await self._send_local_file(chat_id, audio_path, "m.audio", caption, reply_to, metadata=metadata)
+        """Upload an audio file as a voice message (MSC3245 native voice)."""
+        return await self._send_local_file(
+            chat_id, audio_path, "m.audio", caption, reply_to, 
+            metadata=metadata, is_voice=True
+        )
 
     async def send_video(
         self,
@@ -546,13 +592,16 @@ class MatrixAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        is_voice: bool = False,
     ) -> SendResult:
         """Upload bytes to Matrix and send as a media message."""
         import nio
 
         # Upload to homeserver.
-        resp = await self._client.upload(
-            data,
+        # nio expects a DataProvider (callable) or file-like object, not raw bytes.
+        # nio.upload() returns a tuple (UploadResponse|UploadError, Optional[Dict])
+        resp, maybe_encryption_info = await self._client.upload(
+            io.BytesIO(data),
             content_type=content_type,
             filename=filename,
         )
@@ -573,6 +622,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 "size": len(data),
             },
         }
+
+        # Add MSC3245 voice flag for native voice messages.
+        if is_voice:
+            msg_content["org.matrix.msc3245.voice"] = {}
 
         if reply_to:
             msg_content["m.relates_to"] = {
@@ -601,6 +654,7 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         file_name: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        is_voice: bool = False,
     ) -> SendResult:
         """Read a local file and upload it."""
         p = Path(file_path)
@@ -613,7 +667,7 @@ class MatrixAdapter(BasePlatformAdapter):
         ct = mimetypes.guess_type(fname)[0] or "application/octet-stream"
         data = p.read_bytes()
 
-        return await self._upload_and_send(room_id, data, fname, ct, msgtype, caption, reply_to, metadata)
+        return await self._upload_and_send(room_id, data, fname, ct, msgtype, caption, reply_to, metadata, is_voice)
 
     # ------------------------------------------------------------------
     # Sync loop
@@ -652,17 +706,22 @@ class MatrixAdapter(BasePlatformAdapter):
         Hermes uses a custom sync loop instead of matrix-nio's sync_forever(),
         so we need to explicitly drive the key management work that sync_forever()
         normally handles for encrypted rooms.
+
+        Also auto-trusts all devices (so senders share session keys with us)
+        and retries decryption for any buffered MegolmEvents.
         """
         client = self._client
         if not client or not self._encryption or not getattr(client, "olm", None):
             return
+
+        did_query_keys = client.should_query_keys
 
         tasks = [asyncio.create_task(client.send_to_device_messages())]
 
         if client.should_upload_keys:
             tasks.append(asyncio.create_task(client.keys_upload()))
 
-        if client.should_query_keys:
+        if did_query_keys:
             tasks.append(asyncio.create_task(client.keys_query()))
 
         if client.should_claim_keys:
@@ -677,6 +736,111 @@ class MatrixAdapter(BasePlatformAdapter):
                 raise
             except Exception as exc:
                 logger.warning("Matrix: E2EE maintenance task failed: %s", exc)
+
+        # After key queries, auto-trust all devices so senders share keys with
+        # us.  For a bot this is the right default — we want to decrypt
+        # everything, not enforce manual verification.
+        if did_query_keys:
+            self._auto_trust_devices()
+
+        # Retry any buffered undecrypted events now that new keys may have
+        # arrived (from key requests, key queries, or to-device forwarding).
+        if self._pending_megolm:
+            await self._retry_pending_decryptions()
+
+    def _auto_trust_devices(self) -> None:
+        """Trust/verify all unverified devices we know about.
+
+        When other clients see our device as verified, they proactively share
+        Megolm session keys with us.  Without this, many clients will refuse
+        to include an unverified device in key distributions.
+        """
+        client = self._client
+        if not client:
+            return
+
+        device_store = getattr(client, "device_store", None)
+        if not device_store:
+            return
+
+        own_device = getattr(client, "device_id", None)
+        trusted_count = 0
+
+        try:
+            # DeviceStore.__iter__ yields OlmDevice objects directly.
+            for device in device_store:
+                if getattr(device, "device_id", None) == own_device:
+                    continue
+                if not getattr(device, "verified", False):
+                    client.verify_device(device)
+                    trusted_count += 1
+        except Exception as exc:
+            logger.debug("Matrix: auto-trust error: %s", exc)
+
+        if trusted_count:
+            logger.info("Matrix: auto-trusted %d new device(s)", trusted_count)
+
+    async def _retry_pending_decryptions(self) -> None:
+        """Retry decrypting buffered MegolmEvents after new keys arrive."""
+        import nio
+
+        client = self._client
+        if not client or not self._pending_megolm:
+            return
+
+        now = time.time()
+        still_pending: list = []
+
+        for room, event, ts in self._pending_megolm:
+            # Drop events that have aged past the TTL.
+            if now - ts > _PENDING_EVENT_TTL:
+                logger.debug(
+                    "Matrix: dropping expired pending event %s (age %.0fs)",
+                    getattr(event, "event_id", "?"), now - ts,
+                )
+                continue
+
+            try:
+                decrypted = client.decrypt_event(event)
+            except Exception:
+                # Still missing the key — keep in buffer.
+                still_pending.append((room, event, ts))
+                continue
+
+            if isinstance(decrypted, nio.MegolmEvent):
+                # decrypt_event returned the same undecryptable event.
+                still_pending.append((room, event, ts))
+                continue
+
+            logger.info(
+                "Matrix: decrypted buffered event %s (%s)",
+                getattr(event, "event_id", "?"),
+                type(decrypted).__name__,
+            )
+
+            # Route to the appropriate handler based on decrypted type.
+            try:
+                if isinstance(decrypted, nio.RoomMessageText):
+                    await self._on_room_message(room, decrypted)
+                elif isinstance(
+                    decrypted,
+                    (nio.RoomMessageImage, nio.RoomMessageAudio,
+                     nio.RoomMessageVideo, nio.RoomMessageFile),
+                ):
+                    await self._on_room_message_media(room, decrypted)
+                else:
+                    logger.debug(
+                        "Matrix: decrypted event %s has unhandled type %s",
+                        getattr(event, "event_id", "?"),
+                        type(decrypted).__name__,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Matrix: error processing decrypted event %s: %s",
+                    getattr(event, "event_id", "?"), exc,
+                )
+
+        self._pending_megolm = still_pending
 
     # ------------------------------------------------------------------
     # Event callbacks
@@ -699,13 +863,29 @@ class MatrixAdapter(BasePlatformAdapter):
         if event_ts and event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS:
             return
 
-        # Handle decrypted MegolmEvents — extract the inner event.
+        # Handle undecryptable MegolmEvents: request the missing session key
+        # and buffer the event for retry once the key arrives.
         if isinstance(event, nio.MegolmEvent):
-            # Failed to decrypt.
             logger.warning(
-                "Matrix: could not decrypt event %s in %s",
+                "Matrix: could not decrypt event %s in %s — requesting key",
                 event.event_id, room.room_id,
             )
+
+            # Ask other devices in the room to forward the session key.
+            try:
+                resp = await self._client.request_room_key(event)
+                if hasattr(resp, "event_id") or not isinstance(resp, Exception):
+                    logger.debug(
+                        "Matrix: room key request sent for session %s",
+                        getattr(event, "session_id", "?"),
+                    )
+            except Exception as exc:
+                logger.debug("Matrix: room key request failed: %s", exc)
+
+            # Buffer for retry on next maintenance cycle.
+            self._pending_megolm.append((room, event, time.time()))
+            if len(self._pending_megolm) > _MAX_PENDING_EVENTS:
+                self._pending_megolm = self._pending_megolm[-_MAX_PENDING_EVENTS:]
             return
 
         # Skip edits (m.replace relation).
@@ -728,6 +908,30 @@ class MatrixAdapter(BasePlatformAdapter):
         thread_id = None
         if relates_to.get("rel_type") == "m.thread":
             thread_id = relates_to.get("event_id")
+
+        # Require-mention gating.
+        if not is_dm:
+            free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
+            free_rooms = {r.strip() for r in free_rooms_raw.split(",") if r.strip()}
+            require_mention = os.getenv("MATRIX_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no")
+            is_free_room = room.room_id in free_rooms
+            in_bot_thread = bool(thread_id and thread_id in self._bot_participated_threads)
+
+            formatted_body = source_content.get("formatted_body")
+            if require_mention and not is_free_room and not in_bot_thread:
+                if not self._is_bot_mentioned(body, formatted_body):
+                    return
+
+        # Strip mention from body when present (including in DMs).
+        if self._is_bot_mentioned(body, source_content.get("formatted_body")):
+            body = self._strip_mention(body)
+
+        # Auto-thread: create a thread for non-DM, non-threaded messages.
+        if not is_dm and not thread_id:
+            auto_thread = os.getenv("MATRIX_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
+            if auto_thread:
+                thread_id = event.event_id
+                self._track_thread(thread_id)
 
         # Reply-to detection.
         reply_to = None
@@ -773,6 +977,9 @@ class MatrixAdapter(BasePlatformAdapter):
             reply_to_message_id=reply_to,
         )
 
+        if thread_id:
+            self._track_thread(thread_id)
+
         await self.handle_message(msg_event)
 
     async def _on_room_message_media(self, room: Any, event: Any) -> None:
@@ -808,11 +1015,19 @@ class MatrixAdapter(BasePlatformAdapter):
         event_mimetype = (content_info.get("info") or {}).get("mimetype", "")
         media_type = "application/octet-stream"
         msg_type = MessageType.DOCUMENT
+        is_voice_message = False
+        
         if isinstance(event, nio.RoomMessageImage):
             msg_type = MessageType.PHOTO
             media_type = event_mimetype or "image/png"
         elif isinstance(event, nio.RoomMessageAudio):
-            msg_type = MessageType.AUDIO
+            # Check for MSC3245 voice flag: org.matrix.msc3245.voice: {}
+            source_content = getattr(event, "source", {}).get("content", {})
+            if source_content.get("org.matrix.msc3245.voice") is not None:
+                is_voice_message = True
+                msg_type = MessageType.VOICE
+            else:
+                msg_type = MessageType.AUDIO
             media_type = event_mimetype or "audio/ogg"
         elif isinstance(event, nio.RoomMessageVideo):
             msg_type = MessageType.VIDEO
@@ -850,6 +1065,55 @@ class MatrixAdapter(BasePlatformAdapter):
         if relates_to.get("rel_type") == "m.thread":
             thread_id = relates_to.get("event_id")
 
+        # Require-mention gating (media messages).
+        if not is_dm:
+            free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
+            free_rooms = {r.strip() for r in free_rooms_raw.split(",") if r.strip()}
+            require_mention = os.getenv("MATRIX_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no")
+            is_free_room = room.room_id in free_rooms
+            in_bot_thread = bool(thread_id and thread_id in self._bot_participated_threads)
+
+            if require_mention and not is_free_room and not in_bot_thread:
+                formatted_body = source_content.get("formatted_body")
+                if not self._is_bot_mentioned(body, formatted_body):
+                    return
+
+        # Strip mention from body when present (including in DMs).
+        if self._is_bot_mentioned(body, source_content.get("formatted_body")):
+            body = self._strip_mention(body)
+
+        # Auto-thread: create a thread for non-DM, non-threaded messages.
+        if not is_dm and not thread_id:
+            auto_thread = os.getenv("MATRIX_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
+            if auto_thread:
+                thread_id = event.event_id
+                self._track_thread(thread_id)
+
+        # For voice messages, cache audio locally for transcription tools.
+        # Use the authenticated nio client to download (Matrix requires auth for media).
+        media_urls = [http_url] if http_url else None
+        media_types = [media_type] if http_url else None
+        
+        if is_voice_message and url and url.startswith("mxc://"):
+            try:
+                import nio
+                from gateway.platforms.base import cache_audio_from_bytes
+                
+                resp = await self._client.download(mxc=url)
+                if isinstance(resp, nio.MemoryDownloadResponse):
+                    # Extract extension from mimetype or default to .ogg
+                    ext = ".ogg"
+                    if media_type and "/" in media_type:
+                        subtype = media_type.split("/")[1]
+                        ext = f".{subtype}" if subtype else ".ogg"
+                    local_path = cache_audio_from_bytes(resp.body, ext)
+                    media_urls = [local_path]
+                    logger.debug("Matrix: cached voice message to %s", local_path)
+                else:
+                    logger.warning("Matrix: failed to download voice: %s", getattr(resp, "message", resp))
+            except Exception as e:
+                logger.warning("Matrix: failed to cache voice message, using HTTP URL: %s", e)
+
         source = self.build_source(
             chat_id=room.room_id,
             chat_type=chat_type,
@@ -858,8 +1122,9 @@ class MatrixAdapter(BasePlatformAdapter):
             thread_id=thread_id,
         )
 
-        # Use cached local path for images, HTTP URL for other media types
-        media_urls = [cached_path] if cached_path else ([http_url] if http_url else None)
+        # Use cached local path for images (voice messages already handled above).
+        if cached_path:
+            media_urls = [cached_path]
         media_types = [media_type] if media_urls else None
 
         msg_event = MessageEvent(
@@ -871,6 +1136,9 @@ class MatrixAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
         )
+
+        if thread_id:
+            self._track_thread(thread_id)
 
         await self.handle_message(msg_event)
 
@@ -958,6 +1226,82 @@ class MatrixAdapter(BasePlatformAdapter):
             rid: (rid in dm_room_ids)
             for rid in self._joined_rooms
         }
+
+    # ------------------------------------------------------------------
+    # Thread participation tracking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _thread_state_path() -> Path:
+        """Path to the persisted thread participation set."""
+        from hermes_cli.config import get_hermes_home
+        return get_hermes_home() / "matrix_threads.json"
+
+    @classmethod
+    def _load_participated_threads(cls) -> set:
+        """Load persisted thread IDs from disk."""
+        path = cls._thread_state_path()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return set(data)
+        except Exception as e:
+            logger.debug("Could not load matrix thread state: %s", e)
+        return set()
+
+    def _save_participated_threads(self) -> None:
+        """Persist the current thread set to disk (best-effort)."""
+        path = self._thread_state_path()
+        try:
+            thread_list = list(self._bot_participated_threads)
+            if len(thread_list) > self._MAX_TRACKED_THREADS:
+                thread_list = thread_list[-self._MAX_TRACKED_THREADS:]
+                self._bot_participated_threads = set(thread_list)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(thread_list), encoding="utf-8")
+        except Exception as e:
+            logger.debug("Could not save matrix thread state: %s", e)
+
+    def _track_thread(self, thread_id: str) -> None:
+        """Add a thread to the participation set and persist."""
+        if thread_id not in self._bot_participated_threads:
+            self._bot_participated_threads.add(thread_id)
+            self._save_participated_threads()
+
+    # ------------------------------------------------------------------
+    # Mention detection helpers
+    # ------------------------------------------------------------------
+
+    def _is_bot_mentioned(self, body: str, formatted_body: Optional[str] = None) -> bool:
+        """Return True if the bot is mentioned in the message."""
+        if not body and not formatted_body:
+            return False
+        # Check for full @user:server in body
+        if self._user_id and self._user_id in body:
+            return True
+        # Check for localpart with word boundaries (case-insensitive)
+        if self._user_id and ":" in self._user_id:
+            localpart = self._user_id.split(":")[0].lstrip("@")
+            if localpart and re.search(r'\b' + re.escape(localpart) + r'\b', body, re.IGNORECASE):
+                return True
+        # Check formatted_body for Matrix pill
+        if formatted_body and self._user_id:
+            if f"matrix.to/#/{self._user_id}" in formatted_body:
+                return True
+        return False
+
+    def _strip_mention(self, body: str) -> str:
+        """Remove bot mention from message body."""
+        # Remove full @user:server
+        if self._user_id:
+            body = body.replace(self._user_id, "")
+        # If still contains localpart mention, remove it
+        if self._user_id and ":" in self._user_id:
+            localpart = self._user_id.split(":")[0].lstrip("@")
+            if localpart:
+                body = re.sub(r'\b' + re.escape(localpart) + r'\b', '', body, flags=re.IGNORECASE)
+        return body.strip()
 
     def _get_display_name(self, room: Any, user_id: str) -> str:
         """Get a user's display name in a room, falling back to user_id."""

@@ -4,7 +4,7 @@ import time
 import pytest
 from pathlib import Path
 
-from hermes_state import SessionDB
+from hermes_state import SCHEMA_VERSION, SessionDB
 
 
 @pytest.fixture()
@@ -376,6 +376,20 @@ class TestFTS5Search:
         assert any("chat-send" in (r.get("snippet") or r.get("content", "")).lower()
                     for r in results)
 
+    def test_search_dotted_term_does_not_crash(self, db):
+        """Dotted terms like 'P2.2' or 'simulate.p2.test.ts' should not crash FTS5."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Working on P2.2 session_search edge cases")
+        db.append_message("s1", role="assistant", content="See simulate.p2.test.ts for details")
+
+        results = db.search_messages("P2.2")
+        assert isinstance(results, list)
+        assert len(results) >= 1
+
+        results2 = db.search_messages("simulate.p2.test.ts")
+        assert isinstance(results2, list)
+        assert len(results2) >= 1
+
     def test_search_quoted_phrase_preserved(self, db):
         """User-provided quoted phrases should be preserved for exact matching."""
         db.create_session(session_id="s1", source="cli")
@@ -442,6 +456,27 @@ class TestFTS5Search:
         assert s('"chat-send"') == '"chat-send"'
         # Hyphenated inside a quoted phrase stays as-is
         assert s('"my chat-send thing"') == '"my chat-send thing"'
+
+    def test_sanitize_fts5_quotes_dotted_terms(self):
+        """Dotted terms should be wrapped in quotes to avoid FTS5 query parse edge cases."""
+        from hermes_state import SessionDB
+        s = SessionDB._sanitize_fts5_query
+
+        assert s('P2.2') == '"P2.2"'
+        assert s('simulate.p2') == '"simulate.p2"'
+        assert s('simulate.p2.test.ts') == '"simulate.p2.test.ts"'
+
+        # Already quoted — no double quoting
+        assert s('"P2.2"') == '"P2.2"'
+
+        # Works with boolean syntax
+        result = s('P2.2 OR simulate.p2')
+        assert '"P2.2"' in result
+        assert '"simulate.p2"' in result
+
+        # Mixed dots and hyphens — single pass avoids double-quoting
+        assert s('my-app.config') == '"my-app.config"'
+        assert s('my-app.config.ts') == '"my-app.config.ts"'
 
 
 # =========================================================================
@@ -822,7 +857,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == SCHEMA_VERSION
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -878,12 +913,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to the current schema version
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == SCHEMA_VERSION
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")

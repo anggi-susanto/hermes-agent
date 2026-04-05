@@ -107,7 +107,26 @@ git log -p --follow src/problematic_file.py | head -100
 
 ### 4. Gather Evidence in Multi-Component Systems
 
+**WHEN environment/setup failures block execution before app logic runs (missing extensions, missing drivers, permission-denied cache files):**
+
+Treat the environment as the failing component first.
+Check, in order:
+- runtime capabilities (`php -m`, `python -c`, `node -p`, toolchain version output)
+- package/install state (`dpkg -l`, package manager policy/install candidates)
+- writable project artifacts/caches (ownership and permissions on framework/test cache files)
+- rerun the smallest reproduction immediately after each environment fix
+
+Only after the environment is healthy should you interpret app/test failures as product-code failures.
+
 **WHEN system has multiple components (API → service → database, CI → build → deploy):**
+
+**WHEN a test passes in isolation but fails in the full suite:**
+
+Treat it as a shared-state contamination bug until proven otherwise.
+Check, in order:
+- Environment leakage: a test assumes an env var is absent, but the outer process/suite sets it. For Python tests, explicitly clear the broader fallback vars too (not just the feature-specific one). If needed, use `patch.dict(os.environ, {}, clear=True)` and then add back only the vars the test is meant to see.
+- Global/module caches: config loaders or policy helpers may cache the default path or parsed data. Prefer passing an explicit temp `config_path`/fixture path in tests when the goal is to verify behavior, not the global cache layer.
+- Order dependence: compare targeted test runs vs full-suite runs to confirm the bug is isolation-sensitive before changing production code.
 
 **BEFORE proposing fixes, add diagnostic instrumentation:**
 
@@ -129,6 +148,19 @@ THEN investigate that specific component.
 - What called this function with the bad value?
 - Keep tracing upstream until you find the source
 - Fix at the source, not at the symptom
+
+**Special case: suspicious/truncated file reads or malformed source snapshots**
+
+If a read shows obviously broken text (for example placeholders, truncation artifacts, or malformed tokens that shouldn't compile), do NOT immediately treat it as real source corruption.
+
+Check in this order:
+- Re-read the same region with `read_file` using narrower offsets/limits.
+- Read adjacent ranges to see whether the corruption is only in the snapshot window.
+- Compare with test/build reality. If the full suite is green, assume the first read may be a tooling/snapshot artifact until proven otherwise.
+- Prefer targeted `patch` edits against verified surrounding lines instead of large scripted rewrites when the file content looks unstable.
+- If automated edit anchors fail repeatedly, switch from bulk scripted replacement to smaller verified patches.
+
+This avoids a common failure mode where you start "fixing" a file that was never actually corrupted, and your automation fails because the read context was unreliable.
 
 **Action:** Use `search_files` to trace references:
 
@@ -354,6 +386,24 @@ When fixing bugs:
 2. Debug systematically to find root cause
 3. Fix the root cause (GREEN)
 4. The test proves the fix and prevents regression
+
+## State Machine vs Decision Layer Audits
+
+When a system has both a state machine and a truth/decision layer, treat them as separate responsibilities:
+
+- The truth layer should classify evidence, not mutate state.
+- The state machine should be the only place that authorizes status transitions.
+- If the decision layer emits verdicts, keep them semantically complete (e.g. pass vs blocked vs fail) so the state layer can map them cleanly.
+- Add regression tests for both layers:
+  - truth classification tests for evidence semantics
+  - transition tests for allowed/forbidden state changes
+- When you see status drift, audit every writer of the status field before patching the classifier.
+- In orchestrators, route every persisted status change through the transition helper first, then patch the provider with the transition result (status + timestamp fields), not with ad-hoc status literals.
+- Update smoke-test/mock providers to preserve partial updates like started_at/completed_at/updated_at so tests catch state-loss bugs.
+- If a decision API becomes tri-state (e.g. allow / block / ask), update all consumers to use explicit identity checks (`is True` / `is False` / `is None`) instead of truthiness checks like `if not allowed:`.
+- When widening a return type to `Optional[...]`, verify the relevant import list immediately so annotation-only changes do not introduce runtime import errors.
+
+This pattern avoids the common bug where "blocked" and "failed" get conflated and the orchestrator starts making contradictory updates.
 
 ## Real-World Impact
 

@@ -207,6 +207,7 @@ When landing Task 7.x orchestration coverage:
 - For SEO revision regressions, assert contract-level outcomes (`seo_revision_count`, `seo_quality_review.initial_score/final_score`, `final_passed`) first; keep title-content assertions non-brittle (avoid strict case-sensitive token checks like `includes('Founder')` unless casing is explicitly part of the contract).
 - Patch-tool lint output complaining that `tsc` is missing is still non-authoritative here; after async release wiring, trust the repo-native `node scripts/run-tests.ts` / `npm test` harness and expect the real signal to come from failing assertions, not the patch auto-lint banner.
 - When committing after `scripts/run-tests.ts` passes, do one explicit `git status --short` review because unrelated docs or generated audit files may be sitting dirty in the repo and can get swept into the feature commit if you just `git add -A` out of habit.
+- If you convert a tracker/audit doc from "audit-only" to "implemented", sweep for stale self-contradictions in one pass (old test totals, "no code changes made", and obsolete blocker bullets). Partial section edits can leave the doc internally inconsistent and undermine closeout trust.
 
 ## Verification checklist
 - New phase files created

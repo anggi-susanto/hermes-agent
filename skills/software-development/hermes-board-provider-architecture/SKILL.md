@@ -169,6 +169,33 @@ So when the user says “full control”, explicitly separate:
 - agent-scope operational control
 - elevated board-member/operator control
 
+## Repo vs runtime gap audit rule
+
+When the user asks whether a provider "is already in Hermes" or whether there is a gap between runtime tools and repo code, do not answer from one surface only.
+
+Audit these layers separately:
+
+1. Board/provider integration code in repo
+- check `integrations/boards/<provider>.py`
+- check related tests under `tests/integrations/boards/`
+- check board-auth wiring under `hermes_cli/board_auth.py` and sync/model modules
+
+2. Native Hermes runtime tools
+- check `tools/*.py`
+- check whether anything registers a callable tool through `tools.registry`
+- if it is not exposed from `tools/` and registry wiring, it is not a first-class Hermes tool
+
+3. MCP runtime surface
+- check `~/.hermes/config.yaml` under `mcp_servers:`
+- if configured there, Hermes `mcp_tool.py` will usually expose callable tools named like `mcp_<server>_*`
+- if no `mcp_servers.<provider>` entry exists, there is no native MCP tool surface for that provider even if repo code mentions it elsewhere
+
+Paperclip-specific conclusion pattern:
+- `integrations/boards/paperclip.py` means Paperclip exists as a board provider/control-plane adapter
+- this does NOT mean there is an MCP Paperclip server
+- this does NOT mean there is a first-class Hermes tool unless there is explicit tool wiring
+- absence of `mcp_servers.paperclip` plus no `tools/*paperclip*` exposure means "Paperclip is in repo, but not as MCP/native runtime tool surface"
+
 ## Status/lane mapping rule
 
 Never assume the board's native statuses equal Hermes lifecycle states.

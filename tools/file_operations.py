@@ -32,6 +32,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+from hermes_constants import get_hermes_home
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +47,7 @@ WRITE_DENIED_PATHS = {
         os.path.join(_HOME, ".ssh", "id_rsa"),
         os.path.join(_HOME, ".ssh", "id_ed25519"),
         os.path.join(_HOME, ".ssh", "config"),
-        os.path.join(_HOME, ".hermes", ".env"),
+        str(get_hermes_home() / ".env"),
         os.path.join(_HOME, ".bashrc"),
         os.path.join(_HOME, ".zshrc"),
         os.path.join(_HOME, ".profile"),
@@ -70,6 +71,9 @@ WRITE_DENIED_PREFIXES = [
         os.path.join(_HOME, ".kube"),
         "/etc/sudoers.d",
         "/etc/systemd",
+        os.path.join(_HOME, ".docker"),
+        os.path.join(_HOME, ".azure"),
+        os.path.join(_HOME, ".config", "gh"),
     ]
 ]
 
@@ -894,7 +898,7 @@ class ShellFileOperations(FileOperations):
         hidden_exclude = "-not -path '*/.*'"
 
         cmd = f"find {self._escape_shell_arg(path)} {hidden_exclude} -type f -name {self._escape_shell_arg(search_pattern)} " \
-              f"-printf '%T@ %p\\\\n' 2>/dev/null | sort -rn | tail -n +{offset + 1} | head -n {limit}"
+              f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn | tail -n +{offset + 1} | head -n {limit}"
 
         result = self._exec(cmd, timeout=60)
 

@@ -12,6 +12,8 @@ import asyncio
 import importlib
 import os
 import sys
+import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -82,10 +84,10 @@ def _make_document(
     return doc
 
 
-def _make_message(document=None, caption=None, media_group_id=None, photo=None):
+def _make_message(document=None, caption=None, media_group_id=None, photo=None, message_id=42):
     """Build a mock Telegram Message with the given document/photo."""
     msg = MagicMock()
-    msg.message_id = 42
+    msg.message_id = message_id
     msg.text = caption or ""
     msg.caption = caption
     msg.date = None
@@ -236,15 +238,16 @@ class TestDocumentDownloadBlock:
         assert "Please summarize" in event.text
 
     @pytest.mark.asyncio
-    async def test_unsupported_type_rejected(self, adapter):
+    async def test_zip_document_cached(self, adapter):
+        """A .zip upload should be cached as a supported document."""
         doc = _make_document(file_name="archive.zip", mime_type="application/zip", file_size=100)
         msg = _make_message(document=doc)
         update = _make_update(msg)
 
         await adapter._handle_media_message(update, MagicMock())
         event = adapter.handle_message.call_args[0][0]
-        assert "Unsupported document type" in event.text
-        assert ".zip" in event.text
+        assert event.media_urls and event.media_urls[0].endswith("archive.zip")
+        assert event.media_types == ["application/zip"]
 
     @pytest.mark.asyncio
     async def test_oversized_file_rejected(self, adapter):
@@ -347,9 +350,109 @@ class TestDocumentDownloadBlock:
         adapter.handle_message.assert_called_once()
 
 
+def _write_zip(path: Path, files: dict[str, str]) -> None:
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+
+
 # ---------------------------------------------------------------------------
 # TestMediaGroups — media group (album) buffering
 # ---------------------------------------------------------------------------
+
+class TestDocumentEnrichment:
+    def test_pdf_without_backend_emits_explicit_ocr_fallback(self, tmp_path):
+        from gateway.run import _build_document_context_parts
+
+        pdf_path = tmp_path / "doc_123456789abc_scan.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+        with patch("gateway.run.importlib.util.find_spec", return_value=None):
+            parts = _build_document_context_parts([str(pdf_path)], ["application/pdf"])
+
+        assert len(parts) == 1
+        assert "OCR isn't configured yet" in parts[0]
+        assert "PyMuPDF/pymupdf" in parts[0]
+
+    def test_docx_extracts_readable_text(self, tmp_path):
+        from gateway.run import _build_document_context_parts
+
+        docx_path = tmp_path / "doc_123456789abc_notes.docx"
+        _write_zip(
+            docx_path,
+            {
+                "word/document.xml": (
+                    "<?xml version='1.0' encoding='UTF-8'?>"
+                    "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+                    "<w:body><w:p><w:r><w:t>Hello DOCX</w:t></w:r></w:p></w:body></w:document>"
+                )
+            },
+        )
+
+        parts = _build_document_context_parts(
+            [str(docx_path)],
+            ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+        )
+
+        assert len(parts) == 1
+        assert "Extracted content from notes.docx" in parts[0]
+        assert "Hello DOCX" in parts[0]
+
+    def test_pptx_extracts_slide_text(self, tmp_path):
+        from gateway.run import _build_document_context_parts
+
+        pptx_path = tmp_path / "doc_123456789abc_slides.pptx"
+        _write_zip(
+            pptx_path,
+            {
+                "ppt/slides/slide1.xml": (
+                    "<?xml version='1.0' encoding='UTF-8'?>"
+                    "<p:sld xmlns:p='http://schemas.openxmlformats.org/presentationml/2006/main' "
+                    "xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main'>"
+                    "<p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Hello PPTX</a:t></a:r>"
+                    "</a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
+                )
+            },
+        )
+
+        parts = _build_document_context_parts(
+            [str(pptx_path)],
+            ["application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+        )
+
+        assert len(parts) == 1
+        assert "Extracted content from slides.pptx" in parts[0]
+        assert "Hello PPTX" in parts[0]
+
+    def test_xlsx_extracts_cell_text(self, tmp_path):
+        from gateway.run import _build_document_context_parts
+
+        xlsx_path = tmp_path / "doc_123456789abc_sheet.xlsx"
+        _write_zip(
+            xlsx_path,
+            {
+                "xl/sharedStrings.xml": (
+                    "<?xml version='1.0' encoding='UTF-8'?>"
+                    "<sst xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'>"
+                    "<si><t>Hello XLSX</t></si></sst>"
+                ),
+                "xl/worksheets/sheet1.xml": (
+                    "<?xml version='1.0' encoding='UTF-8'?>"
+                    "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'>"
+                    "<sheetData><row r='1'><c r='A1' t='s'><v>0</v></c></row></sheetData></worksheet>"
+                ),
+            },
+        )
+
+        parts = _build_document_context_parts(
+            [str(xlsx_path)],
+            ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+        )
+
+        assert len(parts) == 1
+        assert "Extracted content from sheet.xlsx" in parts[0]
+        assert "Hello XLSX" in parts[0]
+
 
 class TestMediaGroups:
     @pytest.mark.asyncio
@@ -357,8 +460,8 @@ class TestMediaGroups:
         first_photo = _make_photo(_make_file_obj(b"first"))
         second_photo = _make_photo(_make_file_obj(b"second"))
 
-        msg1 = _make_message(caption="two images", photo=[first_photo])
-        msg2 = _make_message(photo=[second_photo])
+        msg1 = _make_message(caption="two images", photo=[first_photo], message_id=42)
+        msg2 = _make_message(photo=[second_photo], message_id=43)
 
         with patch("gateway.platforms.telegram.cache_image_from_bytes", side_effect=["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]):
             await adapter._handle_media_message(_make_update(msg1), MagicMock())
@@ -377,8 +480,8 @@ class TestMediaGroups:
         first_photo = _make_photo(_make_file_obj(b"first"))
         second_photo = _make_photo(_make_file_obj(b"second"))
 
-        msg1 = _make_message(caption="two images", media_group_id="album-1", photo=[first_photo])
-        msg2 = _make_message(media_group_id="album-1", photo=[second_photo])
+        msg1 = _make_message(caption="two images", media_group_id="album-1", photo=[first_photo], message_id=42)
+        msg2 = _make_message(media_group_id="album-1", photo=[second_photo], message_id=43)
 
         with patch("gateway.platforms.telegram.cache_image_from_bytes", side_effect=["/tmp/one.jpg", "/tmp/two.jpg"]):
             await adapter._handle_media_message(_make_update(msg1), MagicMock())

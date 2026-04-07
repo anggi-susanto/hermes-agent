@@ -1,8 +1,10 @@
 """Tests for user-defined quick commands that bypass the agent loop."""
+import shlex
 import subprocess
-from unittest.mock import MagicMock, patch, AsyncMock
-from rich.text import Text
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
+from rich.text import Text
 
 
 # ── CLI tests ──────────────────────────────────────────────────────────────
@@ -61,6 +63,26 @@ class TestCLIQuickCommands:
         with patch.object(cli, "process_command", wraps=cli.process_command) as spy:
             cli.process_command("/sc some args")
             spy.assert_any_call("/context some args")
+
+    def test_exec_command_expands_shell_quoted_args_placeholder(self):
+        cli = self._make_cli({"say": {"type": "exec", "command": "echo {args}"}})
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n", stderr="")
+        with patch("subprocess.run", return_value=completed) as run_mock:
+            result = cli.process_command("/say hello world")
+
+        assert result is True
+        run_mock.assert_called_once()
+        assert run_mock.call_args.args[0] == f"echo {shlex.quote('hello world')}"
+
+    def test_exec_command_expands_raw_args_placeholder(self):
+        cli = self._make_cli({"say": {"type": "exec", "command": "echo {args_raw}"}})
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n", stderr="")
+        with patch("subprocess.run", return_value=completed) as run_mock:
+            result = cli.process_command("/say hello world")
+
+        assert result is True
+        run_mock.assert_called_once()
+        assert run_mock.call_args.args[0] == "echo hello world"
 
     def test_alias_no_target_shows_error(self):
         cli = self._make_cli({"broken": {"type": "alias", "target": ""}})
@@ -127,27 +149,56 @@ class TestGatewayQuickCommands:
         event.source.chat_id = "123"
         return event
 
-    @pytest.mark.asyncio
-    async def test_exec_command_returns_output(self):
+    @staticmethod
+    def _make_runner(config):
         from gateway.run import GatewayRunner
+
         runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"limits": {"type": "exec", "command": "echo ok"}}}
+        runner.config = config
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_exec_command_returns_output(self):
+        runner = self._make_runner({"quick_commands": {"limits": {"type": "exec", "command": "echo ok"}}})
 
         event = self._make_event("limits")
         result = await runner._handle_message(event)
         assert result == "ok"
 
     @pytest.mark.asyncio
+    async def test_exec_command_expands_shell_quoted_args_placeholder(self):
+        runner = self._make_runner({"quick_commands": {"say": {"type": "exec", "command": "echo {args}"}}})
+
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"ok\n", b"")
+        event = self._make_event("say", "hello world")
+        with patch("asyncio.create_subprocess_shell", return_value=proc) as shell_mock:
+            result = await runner._handle_message(event)
+
+        assert result == "ok"
+        shell_mock.assert_called_once()
+        assert shell_mock.call_args.args[0] == f"echo {shlex.quote('hello world')}"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_expands_raw_args_placeholder(self):
+        runner = self._make_runner({"quick_commands": {"say": {"type": "exec", "command": "echo {args_raw}"}}})
+
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"ok\n", b"")
+        event = self._make_event("say", "hello world")
+        with patch("asyncio.create_subprocess_shell", return_value=proc) as shell_mock:
+            result = await runner._handle_message(event)
+
+        assert result == "ok"
+        shell_mock.assert_called_once()
+        assert shell_mock.call_args.args[0] == "echo hello world"
+
+    @pytest.mark.asyncio
     async def test_unsupported_type_returns_error(self):
-        from gateway.run import GatewayRunner
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"bad": {"type": "prompt", "command": "echo hi"}}}
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
+        runner = self._make_runner({"quick_commands": {"bad": {"type": "prompt", "command": "echo hi"}}})
 
         event = self._make_event("bad")
         result = await runner._handle_message(event)
@@ -156,13 +207,9 @@ class TestGatewayQuickCommands:
 
     @pytest.mark.asyncio
     async def test_timeout_returns_error(self):
-        from gateway.run import GatewayRunner
         import asyncio
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"slow": {"type": "exec", "command": "sleep 100"}}}
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
+
+        runner = self._make_runner({"quick_commands": {"slow": {"type": "exec", "command": "sleep 100"}}})
 
         event = self._make_event("slow")
         with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
@@ -173,15 +220,10 @@ class TestGatewayQuickCommands:
     @pytest.mark.asyncio
     async def test_gateway_config_object_supports_quick_commands(self):
         from gateway.config import GatewayConfig
-        from gateway.run import GatewayRunner
 
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = GatewayConfig(
-            quick_commands={"limits": {"type": "exec", "command": "echo ok"}}
+        runner = self._make_runner(
+            GatewayConfig(quick_commands={"limits": {"type": "exec", "command": "echo ok"}})
         )
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._is_user_authorized = MagicMock(return_value=True)
 
         event = self._make_event("limits")
         result = await runner._handle_message(event)

@@ -33,11 +33,16 @@ class FakeBadRequest(FakeNetworkError):
     pass
 
 
+class FakeTimedOut(FakeNetworkError):
+    pass
+
+
 # Build a fake telegram module tree so the adapter's internal imports work
 _fake_telegram = types.ModuleType("telegram")
 _fake_telegram_error = types.ModuleType("telegram.error")
 _fake_telegram_error.NetworkError = FakeNetworkError
 _fake_telegram_error.BadRequest = FakeBadRequest
+_fake_telegram_error.TimedOut = FakeTimedOut
 _fake_telegram.error = _fake_telegram_error
 _fake_telegram_constants = types.ModuleType("telegram.constants")
 _fake_telegram_constants.ParseMode = SimpleNamespace(MARKDOWN_V2="MarkdownV2")
@@ -55,7 +60,7 @@ def _inject_fake_telegram(monkeypatch):
 def _make_adapter():
     from gateway.platforms.telegram import TelegramAdapter
 
-    config = PlatformConfig(enabled=True, token="fake-token")
+    config = PlatformConfig(enabled=True, token="***")
     adapter = object.__new__(TelegramAdapter)
     adapter._config = config
     adapter._platform = Platform.TELEGRAM
@@ -67,6 +72,8 @@ def _make_adapter():
     adapter._polling_conflict_count = 0
     adapter._polling_network_error_count = 0
     adapter._polling_error_callback_ref = None
+    adapter._recent_outbound_messages = {}
+    adapter._outbound_idempotency_ttl_seconds = 120.0
     adapter.platform = Platform.TELEGRAM
     return adapter
 
@@ -95,6 +102,7 @@ async def test_send_retries_without_thread_on_thread_not_found():
 
     assert result.success is True
     assert result.message_id == "42"
+    assert result.raw_response["dedup_key"]
     # First call has thread_id, second call retries without
     assert len(call_log) == 2
     assert call_log[0]["message_thread_id"] == 99999
@@ -169,6 +177,34 @@ async def test_send_retries_network_errors_normally():
 
 
 @pytest.mark.asyncio
+async def test_send_does_not_retry_timeout():
+    """TimedOut (subclass of NetworkError) should NOT be retried in send().
+
+    The request may have already been delivered to the user — retrying
+    would send duplicate messages.
+    """
+    adapter = _make_adapter()
+
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        raise FakeTimedOut("Timed out waiting for Telegram response")
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="test message",
+    )
+
+    assert result.success is False
+    assert "Timed out" in result.error
+    # CRITICAL: only 1 attempt — no retry for TimedOut
+    assert attempt[0] == 1
+
+
+@pytest.mark.asyncio
 async def test_thread_fallback_only_fires_once():
     """After clearing thread_id, subsequent chunks should also use None."""
     adapter = _make_adapter()
@@ -197,3 +233,52 @@ async def test_thread_fallback_only_fires_once():
     # Second chunk: should use thread_id=None directly (effective_thread_id
     # was cleared per-chunk but the metadata doesn't change between chunks)
     # The key point: the message was delivered despite the invalid thread
+
+
+@pytest.mark.asyncio
+async def test_send_drops_duplicate_outbound_within_ttl():
+    adapter = _make_adapter()
+
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=501)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    first = await adapter.send(chat_id="123", content="same final response")
+    second = await adapter.send(chat_id="123", content="same final response")
+
+    assert first.success is True
+    assert second.success is True
+    assert len(call_log) == 1
+    assert second.raw_response.get("duplicate_suppressed") is True
+    assert second.message_id == first.message_id
+
+
+@pytest.mark.asyncio
+async def test_send_allows_same_outbound_after_idempotency_ttl_expires(monkeypatch):
+    adapter = _make_adapter()
+    adapter._outbound_idempotency_ttl_seconds = 10.0
+
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=600 + len(call_log))
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    from gateway.platforms import telegram as telegram_module
+
+    monotonic_values = iter([0.0, 0.0, 15.0, 15.0, 15.0, 15.0])
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: next(monotonic_values, 15.0))
+
+    first = await adapter.send(chat_id="123", content="same final response")
+    second = await adapter.send(chat_id="123", content="same final response")
+
+    assert first.success is True
+    assert second.success is True
+    assert len(call_log) == 2
+    assert second.raw_response.get("duplicate_suppressed") is not True

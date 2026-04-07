@@ -28,6 +28,9 @@ PLATFORMS = {
     "mattermost": "💬 Mattermost",
     "matrix":   "💬 Matrix",
     "dingtalk": "💬 DingTalk",
+    "feishu": "🪽 Feishu",
+    "wecom": "💬 WeCom",
+    "webhook": "🔗 Webhook",
 }
 
 # ─── Config Helpers ───────────────────────────────────────────────────────────

@@ -186,6 +186,20 @@ git diff --stat
 git add -A && git commit -m "feat: complete [feature name] implementation"
 ```
 
+### 5. Controller-Side Reality Check (Mandatory)
+
+After subagents report success, verify from the controller session before declaring done:
+
+- Check the actual working tree (`git status --short`, `git diff --stat`)
+- Re-run the authoritative test command from the controller session
+- Confirm the changed files match the intended repo/workspace and issue scope
+- If parallel/review subagents report something inconsistent with the real tree, trust the real tree and investigate before proceeding
+
+Why this matters:
+- Subagents work in isolated contexts and can occasionally review the wrong workspace, stale state, or an interrupted partial result
+- A reviewer summary is not proof that files actually changed in the target repo
+- Final success should be based on controller-observed diffs + passing tests, not only subagent summaries
+
 ## Task Granularity
 
 **Each task = 2-5 minutes of focused work.**
@@ -214,6 +228,18 @@ git add -A && git commit -m "feat: complete [feature name] implementation"
 - Let implementer self-review replace actual review (both are needed)
 - **Start code quality review before spec compliance is PASS** (wrong order)
 - Move to next task while either review has open issues
+
+## User Autonomy / Reporting Policy
+
+If the user explicitly authorizes end-to-end execution (for example: "gas sampai kelar", "jangan lapor kalau belum kelar", or equivalent), do **not** stop to present optional decision menus once you already have a reasonable next step from the plan and repo reality.
+
+In that mode:
+- continue task-by-task through the plan without midpoint check-ins
+- only interrupt for a **real blocker** (missing credentials, dangerous state-changing approval boundary, ambiguous business rule, broken environment you cannot resolve safely)
+- report progress inline via tracker/docs/todo updates, not via conversational status pings
+- prefer making the next sensible implementation choice yourself over asking "which option?" when the plan already implies the order
+
+This prevents unnecessary orchestration stalls when the user expects mandor-style autonomous execution.
 
 ## Handling Issues
 

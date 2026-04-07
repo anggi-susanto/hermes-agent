@@ -6,6 +6,7 @@ from the same session and aggregate them before dispatching.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,9 +22,12 @@ def _make_adapter():
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(TelegramAdapter)
     adapter._platform = Platform.TELEGRAM
+    adapter.platform = Platform.TELEGRAM
     adapter.config = config
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
+    adapter._recent_inbound_messages = {}
+    adapter._inbound_dedup_ttl_seconds = 300.0
     adapter._text_batch_delay_seconds = 0.1  # fast for tests
     adapter._active_sessions = {}
     adapter._pending_messages = {}
@@ -119,3 +123,20 @@ class TestTextBatching:
 
         assert len(adapter._pending_text_batches) == 0
         assert len(adapter._pending_text_batch_tasks) == 0
+
+    def test_remember_inbound_message_dedups_same_chat_message_id(self):
+        adapter = _make_adapter()
+        message = SimpleNamespace(chat=SimpleNamespace(id=123), message_id=456)
+
+        assert adapter._remember_inbound_message(message) is True
+        assert adapter._remember_inbound_message(message) is False
+
+    def test_remember_inbound_message_prunes_expired_entries(self):
+        adapter = _make_adapter()
+        adapter._recent_inbound_messages = {"1:2": 0.0}
+        adapter._inbound_dedup_ttl_seconds = 10.0
+
+        with patch("gateway.platforms.telegram.time.monotonic", return_value=15.0):
+            assert adapter._remember_inbound_message(SimpleNamespace(chat=SimpleNamespace(id=1), message_id=2)) is True
+
+        assert adapter._recent_inbound_messages == {"1:2": 15.0}

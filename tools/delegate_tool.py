@@ -289,7 +289,10 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif completed and summary:
+        elif summary:
+            # A summary means the subagent produced usable output.
+            # exit_reason ("completed" vs "max_iterations") already
+            # tells the parent *how* the task ended.
             status = "completed"
         else:
             status = "failed"
@@ -555,6 +558,19 @@ def delegate_task(
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])
+
+    # Notify parent's memory provider of delegation outcomes
+    if parent_agent and hasattr(parent_agent, '_memory_manager') and parent_agent._memory_manager:
+        for entry in results:
+            try:
+                _task_goal = task_list[entry["task_index"]]["goal"] if entry["task_index"] < len(task_list) else ""
+                parent_agent._memory_manager.on_delegation(
+                    task=_task_goal,
+                    result=entry.get("summary", "") or "",
+                    child_session_id=getattr(children[entry["task_index"]][2], "session_id", "") if entry["task_index"] < len(children) else "",
+                )
+            except Exception:
+                pass
 
     total_duration = round(time.monotonic() - overall_start, 2)
 

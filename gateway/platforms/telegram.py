@@ -813,6 +813,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
 
             message_ids = []
+            send_started_at = time.monotonic()
             thread_id = metadata.get("thread_id") if metadata else None
             dedup_key = self._build_outbound_dedup_key(chat_id, chunks, reply_to, thread_id)
             self._prune_outbound_dedup_cache(send_started_at)

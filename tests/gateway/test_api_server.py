@@ -30,6 +30,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.api_server_alerts import verify_alert_signature
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +219,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
+    app["gateway_runner"] = getattr(adapter, "gateway_runner", None)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
@@ -225,6 +227,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    from gateway.platforms.api_server_alerts import handle_alert_dispatch
+    app.router.add_post("/api/alerts", lambda request: handle_alert_dispatch(request, adapter))
     return app
 
 
@@ -1683,3 +1687,172 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+# ---------------------------------------------------------------------------
+# /api/alerts endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestAlertsEndpoint:
+    """Tests for POST /api/alerts maintenance alert dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_verify_alert_signature_valid(self):
+        """HMAC signature verification succeeds with correct secret."""
+        body = b'{"alert_type":"test"}'
+        secret = "my-secret"
+        import hashlib
+        import hmac
+        signature = hmac.new(secret.encode('utf-8'), body, hashlib.sha256).hexdigest()
+        assert verify_alert_signature(body, signature, secret) is True
+
+    @pytest.mark.asyncio
+    async def test_verify_alert_signature_invalid(self):
+        """HMAC signature verification fails with wrong signature."""
+        body = b'{"alert_type":"test"}'
+        secret = "my-secret"
+        wrong_signature = "deadbeef"
+        assert verify_alert_signature(body, wrong_signature, secret) is False
+
+    @pytest.mark.asyncio
+    async def test_verify_alert_signature_no_secret_allows_all(self):
+        """When no secret is configured, all requests are allowed."""
+        body = b'{"alert_type":"test"}'
+        assert verify_alert_signature(body, "any-signature", "") is True
+
+    @pytest.mark.asyncio
+    async def test_alerts_endpoint_invalid_json(self, adapter):
+        """POST /api/alerts rejects invalid JSON."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/alerts",
+                data="not json",
+                headers={"Content-Type": "application/json"}
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_alerts_endpoint_invalid_signature(self, adapter):
+        """POST /api/alerts rejects invalid HMAC signature."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.dict("os.environ", {"HERMES_ALERT_SECRET": "my-secret"}):
+                resp = await cli.post(
+                    "/api/alerts",
+                    json={
+                        "alert_type": "maintenance_failure",
+                        "severity": "error",
+                        "title": "Test alert",
+                        "message": "Test message"
+                    },
+                    headers={"X-Alert-Signature": "invalid-signature"}
+                )
+                assert resp.status == 401
+                data = await resp.json()
+                assert "error" in data
+                assert data["error"]["type"] == "authentication_error"
+
+    @pytest.mark.asyncio
+    async def test_alerts_endpoint_no_gateway_runner(self, adapter):
+        """POST /api/alerts returns 500 when gateway_runner is not available."""
+        app = _create_app(adapter)
+        app["gateway_runner"] = None  # Simulate missing gateway_runner
+        async with TestClient(TestServer(app)) as cli:
+            with patch.dict("os.environ", {"HERMES_ALERT_SECRET": ""}):
+                resp = await cli.post(
+                    "/api/alerts",
+                    json={
+                        "alert_type": "maintenance_failure",
+                        "severity": "error",
+                        "title": "Test alert",
+                        "message": "Test message"
+                    }
+                )
+                assert resp.status == 500
+                data = await resp.json()
+                assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_alerts_endpoint_no_home_channels(self, adapter):
+        """POST /api/alerts returns 500 when no home channels are configured."""
+        from gateway.config import GatewayConfig
+        mock_gateway_runner = MagicMock()
+        mock_config = MagicMock(spec=GatewayConfig)
+        mock_config.get_connected_platforms.return_value = []
+        mock_gateway_runner.config = mock_config
+        
+        adapter.gateway_runner = mock_gateway_runner
+        app = _create_app(adapter)
+        
+        async with TestClient(TestServer(app)) as cli:
+            with patch.dict("os.environ", {"HERMES_ALERT_SECRET": ""}):
+                resp = await cli.post(
+                    "/api/alerts",
+                    json={
+                        "alert_type": "maintenance_failure",
+                        "severity": "error",
+                        "title": "Test alert",
+                        "message": "Test message"
+                    }
+                )
+                assert resp.status == 500
+                data = await resp.json()
+                assert "error" in data
+                assert "No delivery targets" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_alerts_endpoint_successful_dispatch(self, adapter):
+        """POST /api/alerts successfully dispatches to configured channels."""
+        from gateway.config import GatewayConfig, HomeChannel, Platform
+        from gateway.delivery import DeliveryRouter
+        
+        # Mock gateway runner with home channel
+        mock_gateway_runner = MagicMock()
+        mock_config = MagicMock(spec=GatewayConfig)
+        mock_config.get_connected_platforms.return_value = [Platform.TELEGRAM]
+        mock_home = HomeChannel(platform=Platform.TELEGRAM, chat_id="123456", name="Home")
+        mock_config.get_home_channel.return_value = mock_home
+        
+        mock_router = MagicMock(spec=DeliveryRouter)
+        mock_router.deliver = AsyncMock(return_value={
+            "telegram:123456": {
+                "success": True,
+                "result": {"message_id": "msg_123"}
+            }
+        })
+        
+        mock_gateway_runner.config = mock_config
+        mock_gateway_runner.delivery_router = mock_router
+        mock_gateway_runner.adapters = {}
+        
+        adapter.gateway_runner = mock_gateway_runner
+        app = _create_app(adapter)
+        
+        async with TestClient(TestServer(app)) as cli:
+            with patch.dict("os.environ", {"HERMES_ALERT_SECRET": ""}):
+                resp = await cli.post(
+                    "/api/alerts",
+                    json={
+                        "alert_type": "maintenance_failure",
+                        "severity": "error",
+                        "title": "Build failed",
+                        "message": "Release xyz failed to build",
+                        "metadata": {"release_id": "123"}
+                    }
+                )
+                
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["success"] is True
+                assert "telegram:123456" in data["dispatched_to"]
+                assert data["message_ids"]["telegram:123456"] == "msg_123"
+                
+                # Verify deliver was called with correct content
+                mock_router.deliver.assert_called_once()
+                call_args = mock_router.deliver.call_args
+                assert "Build failed" in call_args.kwargs["content"]
+                assert "Release xyz failed to build" in call_args.kwargs["content"]

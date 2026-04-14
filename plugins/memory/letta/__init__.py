@@ -185,7 +185,11 @@ class LettaClient:
         return data if isinstance(data, list) else []
 
     def create_agent(self, *, name: str, tags: List[str]) -> Dict[str, Any]:
-        return self._request("POST", "/v1/agents/", body={"name": name, "tags": tags})
+        return self._request(
+            "POST",
+            "/v1/agents/",
+            body={"name": name, "tags": tags, "model": "letta/letta-free"},
+        )
 
     def get_core_memory_blocks(self, agent_id: str) -> List[Dict[str, Any]]:
         data = self._request("GET", f"/v1/agents/{agent_id}/core-memory/blocks")
@@ -197,9 +201,32 @@ class LettaClient:
     def create_passage(self, agent_id: str, text: str) -> Dict[str, Any]:
         return self._request("POST", f"/v1/agents/{agent_id}/archival-memory", body={"text": text})
 
+    def list_archival_memory(self, agent_id: str, *, limit: int = 100) -> List[Dict[str, Any]]:
+        data = self._request("GET", f"/v1/agents/{agent_id}/archival-memory", params={"limit": limit})
+        return data if isinstance(data, list) else []
+
     def search_archival_memory(self, agent_id: str, *, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         data = self._request("GET", f"/v1/agents/{agent_id}/archival-memory/search", params={"query": query, "top_k": top_k})
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            results = data.get("results")
+            if isinstance(results, list):
+                normalized: List[Dict[str, Any]] = []
+                for item in results:
+                    if isinstance(item, dict):
+                        normalized.append(
+                            {
+                                "id": item.get("id"),
+                                "text": item.get("text") or item.get("content") or "",
+                                "content": item.get("content") or item.get("text") or "",
+                                "timestamp": item.get("timestamp"),
+                                "tags": item.get("tags") or [],
+                                "_raw": item,
+                            }
+                        )
+                return normalized
+        return []
 
 
 class LettaMemoryProvider(MemoryProvider):
@@ -279,7 +306,7 @@ class LettaMemoryProvider(MemoryProvider):
 
     def _agent_name(self) -> str:
         assert self._config is not None
-        return f"{self._config.agent_name_prefix} [{self._safe_slug(self._canonical_user_id)}]"
+        return f"{self._config.agent_name_prefix} {self._safe_slug(self._canonical_user_id)}"
 
     def _ensure_agent(self) -> str:
         assert self._client is not None
@@ -341,7 +368,14 @@ class LettaMemoryProvider(MemoryProvider):
             return {"status": "skipped", "reason": "provider not initialized"}
         text = self._format_memory_record(content, memory_type=memory_type, source=source, confidence=confidence, project=project)
         created = self._client.create_passage(self._agent_id, text)
-        return {"status": "stored", "id": created.get("id"), "memory_type": memory_type}
+        passage_id = ""
+        if isinstance(created, dict):
+            passage_id = str(created.get("id") or "")
+        elif isinstance(created, list) and created:
+            first = created[0]
+            if isinstance(first, dict):
+                passage_id = str(first.get("id") or "")
+        return {"status": "stored", "id": passage_id or None, "memory_type": memory_type}
 
     def _decode_passage(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         text = item.get("text") or item.get("content") or ""
@@ -359,9 +393,29 @@ class LettaMemoryProvider(MemoryProvider):
     def _search(self, query: str, *, top_k: int = 5, memory_type: str = "", project: str = "") -> List[Dict[str, Any]]:
         if not self._initialized or not self._client or not self._agent_id:
             return []
+
+        def _filter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            decoded = []
+            for row in rows:
+                payload = self._decode_passage(row)
+                if not payload:
+                    continue
+                if memory_type and payload.get("memory_type") != memory_type:
+                    continue
+                if project and payload.get("project") not in (project, None, ""):
+                    continue
+                decoded.append(payload)
+            return decoded
+
         rows = self._client.search_archival_memory(self._agent_id, query=query, top_k=top_k)
-        decoded = []
-        for row in rows:
+        decoded = _filter_rows(rows)
+        if decoded:
+            return decoded
+
+        query_terms = [term for term in re.split(r"\W+", query.lower()) if len(term) >= 3]
+        archival_rows = self._client.list_archival_memory(self._agent_id, limit=max(top_k * 10, 100))
+        fallback_hits = []
+        for row in archival_rows:
             payload = self._decode_passage(row)
             if not payload:
                 continue
@@ -369,8 +423,14 @@ class LettaMemoryProvider(MemoryProvider):
                 continue
             if project and payload.get("project") not in (project, None, ""):
                 continue
-            decoded.append(payload)
-        return decoded
+            haystack = json.dumps(payload, ensure_ascii=False).lower()
+            score = sum(1 for term in query_terms if term in haystack)
+            if score > 0:
+                payload["_fallback_score"] = score
+                fallback_hits.append(payload)
+
+        fallback_hits.sort(key=lambda item: item.get("_fallback_score", 0), reverse=True)
+        return fallback_hits[:top_k]
 
     def _render_hits(self, hits: List[Dict[str, Any]]) -> str:
         if not hits:

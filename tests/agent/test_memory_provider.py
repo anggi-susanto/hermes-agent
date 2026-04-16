@@ -797,3 +797,60 @@ class TestSetupFieldFiltering:
         keys = [k for k, _ in fields]
         assert "api_url" in keys
         assert "llm_model" not in keys
+
+
+class TestLettaMemoryProvider:
+    """Targeted tests for the Letta memory plugin contract."""
+
+    def test_load_letta_provider_by_name(self):
+        from plugins.memory import load_memory_provider
+        p = load_memory_provider("letta")
+        assert p is not None
+        assert p.name == "letta"
+
+    def test_letta_is_unavailable_without_base_url(self, monkeypatch):
+        from plugins.memory.letta import LettaMemoryProvider
+        monkeypatch.delenv("LETTA_BASE_URL", raising=False)
+        p = LettaMemoryProvider()
+        assert p.is_available() is False
+
+    def test_letta_memory_write_maps_user_to_profile_and_memory_to_preference(self, monkeypatch):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        monkeypatch.setattr(LettaConfig, "from_global_config", classmethod(lambda cls: LettaConfig(base_url="https://letta.test")))
+        p = LettaMemoryProvider()
+        stored = []
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test")
+        p._agent_id = "agent-123"
+        p._client = object()
+        p._store_memory = lambda content, **kwargs: stored.append({"content": content, **kwargs}) or {"status": "stored"}
+
+        p.on_memory_write("add", "user", "Albert prefers gw/lu")
+        p.on_memory_write("add", "memory", "CentraCast deploys need live verification")
+
+        assert stored[0]["memory_type"] == "profile"
+        assert stored[1]["memory_type"] == "preference"
+
+    def test_letta_skips_non_primary_context(self, monkeypatch):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        monkeypatch.setattr(LettaConfig, "from_global_config", classmethod(lambda cls: LettaConfig(base_url="https://letta.test")))
+        p = LettaMemoryProvider()
+        p.initialize("sess-1", platform="telegram", agent_context="cron", user_id="73784266")
+        assert p._initialized is False
+
+    def test_letta_prefetch_uses_cached_result_for_recallish_queries(self, monkeypatch):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        monkeypatch.setattr(LettaConfig, "from_global_config", classmethod(lambda cls: LettaConfig(base_url="https://letta.test", prefetch_top_k=3)))
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", prefetch_top_k=3)
+        p._client = object()
+        p._agent_id = "agent-123"
+        p._search = lambda query, **kwargs: [{"memory_type": "preference", "project": "centracast", "confidence": 0.9, "content": "Albert wants live runtime verification"}]
+
+        result = p.prefetch("remember deploy preference for centracast")
+        assert "Letta Relevant Memory" in result
+        assert "live runtime verification" in result

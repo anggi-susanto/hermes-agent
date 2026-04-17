@@ -380,7 +380,12 @@ class APIServerAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         self._port: int = int(extra.get("port", os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))))
-        self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        # config.extra['key'] is the authoritative adapter setting in tests and
+        # runtime config. Fall back to env only when key is not provided.
+        if "key" in extra:
+            self._api_key = str(extra.get("key") or "")
+        else:
+            self._api_key = os.getenv("API_SERVER_KEY", "")
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )

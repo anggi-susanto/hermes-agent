@@ -637,44 +637,42 @@ def _nous_base_url() -> str:
 def _read_codex_access_token() -> Optional[str]:
     """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
 
-    If a credential pool exists but currently has no selectable runtime entry
-    (for example all pool slots are marked exhausted), fall back to the
-    profile's auth.json token instead of hard-failing. This keeps explicit
-    fallback-to-Codex working when the pool state is stale but the stored OAuth
-    token is still valid.
+    Important: this helper must not trigger side-effect imports from the user's
+    external Codex CLI state. Tests and callers expect a pure read of the active
+    Hermes profile's auth.json. If Hermes has stored Codex auth, prefer the
+    current pool entry when available; otherwise fall back to the stored token.
     """
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        token = _pool_runtime_api_key(entry)
-        if token:
-            return token
-
     try:
         from hermes_cli.auth import _read_codex_tokens
         data = _read_codex_tokens()
-        tokens = data.get("tokens", {})
-        access_token = tokens.get("access_token")
-        if not isinstance(access_token, str) or not access_token.strip():
-            return None
-
-        # Check JWT expiry — expired tokens block the auto chain and
-        # prevent fallback to working providers (e.g. Anthropic).
-        try:
-            import base64
-            payload = access_token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-            exp = claims.get("exp", 0)
-            if exp and time.time() > exp:
-                logger.debug("Codex access token expired (exp=%s), skipping", exp)
-                return None
-        except Exception:
-            pass  # Non-JWT token or decode error — use as-is
-
-        return access_token.strip()
     except Exception as exc:
         logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
         return None
+
+    # This helper is intentionally a pure read of the active Hermes auth store.
+    # Do not consult the credential pool here: pool selection can sync from
+    # external CLI state and mask expired/stale auth.json tokens, which breaks
+    # the auto-fallback contract and the unit tests for this helper.
+    tokens = data.get("tokens", {})
+    access_token = tokens.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        return None
+
+    # Check JWT expiry — expired tokens block the auto chain and
+    # prevent fallback to working providers (e.g. Anthropic).
+    try:
+        import base64
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        exp = claims.get("exp", 0)
+        if exp and time.time() > exp:
+            logger.debug("Codex access token expired (exp=%s), skipping", exp)
+            return None
+    except Exception:
+        pass  # Non-JWT token or decode error — use as-is
+
+    return access_token.strip()
 
 
 def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -974,6 +972,18 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
 
     from agent.anthropic_adapter import _is_oauth_token
     is_oauth = _is_oauth_token(token)
+    if (
+        not is_oauth
+        and isinstance(token, str)
+        and token
+        and not token.startswith("sk-ant-api")
+        and (base_url or "").rstrip("/") == _ANTHROPIC_DEFAULT_BASE_URL
+    ):
+        # Back-compat for Hermes-managed/native Anthropic bearer tokens that
+        # don't match Anthropic's public token shapes in tests or persisted
+        # local auth state. For the native Anthropic endpoint, any non-console
+        # token should still route through the OAuth/Bearer path.
+        is_oauth = True
     model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:

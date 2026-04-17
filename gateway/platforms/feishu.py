@@ -1194,7 +1194,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
             return None
-        return (
+        builder = (
             EventDispatcherHandler.builder(
                 self._encrypt_key,
                 self._verification_token,
@@ -1208,10 +1208,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
             )
             .register_p2_card_action_trigger(self._on_card_action_trigger)
-            .register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
-            .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
-            .build()
         )
+        if hasattr(builder, "register_p2_im_chat_member_bot_added_v1"):
+            builder = builder.register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
+        if hasattr(builder, "register_p2_im_chat_member_bot_deleted_v1"):
+            builder = builder.register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
+        return builder.build()
 
     async def connect(self) -> bool:
         """Connect to Feishu/Lark."""

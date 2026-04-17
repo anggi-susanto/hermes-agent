@@ -92,6 +92,28 @@ class TestHonchoDoctorConfigDetection:
         assert not doctor._honcho_is_configured_for_doctor()
 
 
+class TestLettaDoctorConfigDetection:
+    def test_reports_configured_when_enabled_with_base_url(self, monkeypatch):
+        fake_config = SimpleNamespace(enabled=True, base_url="https://letta.test")
+
+        monkeypatch.setattr(
+            "plugins.memory.letta.LettaConfig.from_global_config",
+            classmethod(lambda cls: fake_config),
+        )
+
+        assert doctor._letta_is_configured_for_doctor()
+
+    def test_reports_not_configured_without_base_url(self, monkeypatch):
+        fake_config = SimpleNamespace(enabled=True, base_url="")
+
+        monkeypatch.setattr(
+            "plugins.memory.letta.LettaConfig.from_global_config",
+            classmethod(lambda cls: fake_config),
+        )
+
+        assert not doctor._letta_is_configured_for_doctor()
+
+
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     """Doctor should present CLI-gated tools as available in CLI context."""
     project_root = tmp_path / "project"
@@ -223,6 +245,31 @@ class TestDoctorMemoryProviderSection:
         out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
         assert "Memory Provider" in out
         assert "Built-in memory active" not in out
+
+    def test_letta_provider_reports_config_and_connectivity(self, monkeypatch, tmp_path):
+        fake_config = SimpleNamespace(
+            enabled=True,
+            base_url="https://letta.test",
+            project_id="proj-123",
+            recall_mode="hybrid",
+        )
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def list_agents(self, name):
+                return []
+
+        monkeypatch.setattr("plugins.memory.letta.LettaConfig.from_global_config", classmethod(lambda cls: fake_config))
+        monkeypatch.setattr("plugins.memory.letta.LettaClient", FakeClient)
+
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="letta")
+
+        assert "Memory Provider" in out
+        assert "Letta connected" in out
+        assert "mode=hybrid" in out
+        assert "project_id=proj-123" in out
 
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):

@@ -97,17 +97,33 @@ def _honcho_is_configured_for_doctor() -> bool:
         return False
 
 
+def _letta_is_configured_for_doctor() -> bool:
+    """Return True when Letta is configured enough for doctor diagnostics."""
+    try:
+        from plugins.memory.letta import LettaConfig
+
+        cfg = LettaConfig.from_global_config()
+        return bool(cfg.enabled and cfg.base_url)
+    except Exception:
+        return False
+
+
 def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
     """Adjust runtime-gated tool availability for doctor diagnostics."""
-    if not _honcho_is_configured_for_doctor():
+    configured_runtime_tools = set()
+    if _honcho_is_configured_for_doctor():
+        configured_runtime_tools.add("honcho")
+    if _letta_is_configured_for_doctor():
+        configured_runtime_tools.add("letta")
+    if not configured_runtime_tools:
         return available, unavailable
 
     updated_available = list(available)
     updated_unavailable = []
     for item in unavailable:
-        if item.get("name") == "honcho":
-            if "honcho" not in updated_available:
-                updated_available.append("honcho")
+        if item.get("name") in configured_runtime_tools:
+            if item.get("name") not in updated_available:
+                updated_available.append(item.get("name"))
             continue
         updated_unavailable.append(item)
     return updated_available, updated_unavailable
@@ -928,6 +944,29 @@ def run_doctor(args):
             issues.append("Mem0 is set as memory provider but mem0ai is not installed")
         except Exception as _e:
             check_warn("Mem0 check failed", str(_e))
+    elif _active_memory_provider == "letta":
+        try:
+            from plugins.memory.letta import LettaClient, LettaConfig
+
+            lcfg = LettaConfig.from_global_config()
+            if not lcfg.enabled:
+                check_info("Letta disabled (set memory.letta.enabled: true to activate)")
+            elif not lcfg.base_url:
+                check_fail("Letta base URL not set", "run: hermes memory setup")
+                issues.append("Letta is set as memory provider but base_url is missing")
+            else:
+                client = LettaClient(lcfg)
+                client.list_agents(name="Hermes Doctor Probe")
+                detail = f"mode={lcfg.recall_mode}"
+                if lcfg.project_id:
+                    detail += f" project_id={lcfg.project_id}"
+                check_ok("Letta connected", detail)
+        except ImportError:
+            check_fail("Letta plugin not loadable", "run: hermes memory setup")
+            issues.append("Letta is set as memory provider but plugin is not loadable")
+        except Exception as _e:
+            check_fail("Letta connection failed", str(_e))
+            issues.append(f"Letta unreachable: {_e}")
     else:
         # Generic check for other memory providers (openviking, hindsight, etc.)
         try:

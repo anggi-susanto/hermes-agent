@@ -12,8 +12,9 @@ Memory model:
 
 Write policy:
 - mirror built-in memory writes (user/profile durable facts)
+- persist non-transient conversation turns for continuity
 - optional session-end summaries
-- ignore transient turn-by-turn chat spam
+- ignore transient turn-by-turn chat spam only when the exchange is trivial
 
 Read policy:
 - prefetch on session start / ambiguous queries / project references
@@ -22,6 +23,7 @@ Read policy:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -33,7 +35,50 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib import error, parse, request
 
+
+def _prompt_text(label: str, default: Optional[str] = None, secret: bool = False) -> str:
+    prompt = f"  {label}"
+    if default not in (None, ""):
+        prompt += f" [{default}]"
+    prompt += ": "
+    if secret:
+        import getpass
+        return getpass.getpass(prompt)
+    value = input(prompt).strip()
+    return value or (default or "")
+
+
+def _prompt_yes_no(label: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    value = input(f"  {label} [{suffix}]: ").strip().lower()
+    if not value:
+        return default
+    return value in {"y", "yes", "1", "true"}
+
+
+def _write_env_vars(env_path: Path, env_writes: Dict[str, str]) -> None:
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_lines: List[str] = []
+    if env_path.exists():
+        existing_lines = env_path.read_text(encoding="utf-8").splitlines()
+    updated_keys = set()
+    new_lines: List[str] = []
+    for line in existing_lines:
+        key, sep, _value = line.partition("=")
+        stripped = key.strip()
+        if sep and stripped in env_writes:
+            new_lines.append(f"{stripped}={env_writes[stripped]}")
+            updated_keys.add(stripped)
+        else:
+            new_lines.append(line)
+    for key, value in env_writes.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(new_lines).rstrip() + "\n", encoding="utf-8")
+
+from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +142,7 @@ CONCLUDE_SCHEMA = {
 }
 
 ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA]
+ENTRY_DELIMITER = "\n§\n"
 
 
 @dataclass
@@ -108,6 +154,13 @@ class LettaConfig:
     user_id_header: str = ""
     project_id: str = ""
     prefetch_top_k: int = 5
+    recall_mode: str = "hybrid"
+    injection_frequency: str = "every-turn"
+    first_turn_context_enabled: bool = True
+    context_char_limit: int = 1200
+    context_tokens: int = 0
+    context_cadence: int = 1
+    dialectic_cadence: int = 1
     auto_session_summary: bool = True
     session_summary_char_limit: int = 1200
 
@@ -129,9 +182,38 @@ class LettaConfig:
             user_id_header=letta.get("user_id_header", env.get("LETTA_USER_ID_HEADER", "")),
             project_id=env.get("LETTA_PROJECT_ID") or letta.get("project_id") or "",
             prefetch_top_k=int(letta.get("prefetch_top_k", 5) or 5),
+            recall_mode=_normalize_recall_mode(letta.get("recall_mode") or letta.get("recallMode") or "hybrid"),
+            injection_frequency=_normalize_injection_frequency(letta.get("injection_frequency") or letta.get("injectionFrequency") or "every-turn"),
+            first_turn_context_enabled=_to_bool(letta.get("first_turn_context_enabled", letta.get("firstTurnContextEnabled", True)), default=True),
+            context_char_limit=int(letta.get("context_char_limit", letta.get("contextCharLimit", 1200)) or 1200),
+            context_tokens=int(letta.get("context_tokens", letta.get("contextTokens", 0)) or 0),
+            context_cadence=max(1, int(letta.get("context_cadence", letta.get("contextCadence", 1)) or 1)),
+            dialectic_cadence=max(1, int(letta.get("dialectic_cadence", letta.get("dialecticCadence", 1)) or 1)),
             auto_session_summary=str(letta.get("auto_session_summary", True)).lower() in ("true", "1", "yes"),
             session_summary_char_limit=int(letta.get("session_summary_char_limit", 1200) or 1200),
         )
+
+
+def _normalize_recall_mode(value: Any) -> str:
+    raw = str(value or "hybrid").strip().lower()
+    if raw in {"tools", "context", "hybrid"}:
+        return raw
+    return "hybrid"
+
+
+def _normalize_injection_frequency(value: Any) -> str:
+    raw = str(value or "every-turn").strip().lower()
+    if raw in {"first-turn", "every-turn"}:
+        return raw
+    return "every-turn"
+
+
+def _to_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class LettaClient:
@@ -239,6 +321,14 @@ class LettaMemoryProvider(MemoryProvider):
         self._agent_id = ""
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._sync_thread: Optional[threading.Thread] = None
+        self._first_turn_context: Optional[str] = None
+        self._turn_count = 0
+        self._turn_sequence = 0
+        self._last_context_turn = -999
+        self._last_dialectic_turn = -999
+        self._conversation_chunk_chars = 1200
         self._initialized = False
 
     @property
@@ -259,6 +349,13 @@ class LettaMemoryProvider(MemoryProvider):
             {"key": "project_id", "description": "Optional Letta project ID", "secret": True, "env_var": "LETTA_PROJECT_ID"},
             {"key": "agent_name_prefix", "description": "Prefix for per-user Letta agents", "default": "Hermes Memory"},
             {"key": "prefetch_top_k", "description": "Default number of recall hits", "default": 5},
+            {"key": "recall_mode", "description": "Recall mode for Letta memory", "choices": ["hybrid", "context", "tools"], "default": "hybrid"},
+            {"key": "injection_frequency", "description": "How often auto-context is injected", "choices": ["every-turn", "first-turn"], "default": "every-turn"},
+            {"key": "first_turn_context_enabled", "description": "Warm and bake Letta context on session start", "choices": [True, False], "default": True},
+            {"key": "context_char_limit", "description": "Max chars of auto-injected Letta context", "default": 1200},
+            {"key": "context_tokens", "description": "Approx token budget for auto-injected Letta context (0 disables token cap)", "default": 0},
+            {"key": "context_cadence", "description": "Minimum turns between Letta context refreshes", "default": 1},
+            {"key": "dialectic_cadence", "description": "Minimum turns between Letta query-triggered prefetches", "default": 1},
             {"key": "auto_session_summary", "description": "Store compact session summaries at session end", "choices": [True, False], "default": True},
             {"key": "session_summary_char_limit", "description": "Max chars for generated session summary text", "default": 1200},
         ]
@@ -273,6 +370,85 @@ class LettaMemoryProvider(MemoryProvider):
                 existing = {}
         existing.update(values)
         config_path.write_text(json.dumps(existing, indent=2))
+
+    def test_connection(self, values: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            cfg = LettaConfig(
+                base_url=str(values.get("base_url", "")).rstrip("/"),
+                api_key=str(values.get("api_key", "") or ""),
+                project_id=str(values.get("project_id", "") or ""),
+                agent_name_prefix=str(values.get("agent_name_prefix", "Hermes Memory") or "Hermes Memory"),
+                recall_mode=_normalize_recall_mode(values.get("recall_mode") or "hybrid"),
+                injection_frequency=_normalize_injection_frequency(values.get("injection_frequency") or "every-turn"),
+                first_turn_context_enabled=_to_bool(values.get("first_turn_context_enabled", True), default=True),
+                context_char_limit=int(values.get("context_char_limit", 1200) or 1200),
+                context_tokens=int(values.get("context_tokens", 0) or 0),
+                context_cadence=max(1, int(values.get("context_cadence", 1) or 1)),
+                dialectic_cadence=max(1, int(values.get("dialectic_cadence", 1) or 1)),
+            )
+            client = LettaClient(cfg)
+            client.list_agents(name="Hermes Doctor Probe")
+            return {"ok": True, "detail": "reachable"}
+        except Exception as e:
+            return {"ok": False, "detail": str(e)}
+
+    def post_setup(self, hermes_home: str, config: dict) -> None:
+        from hermes_cli.config import save_config
+
+        print("\n  Configuring Letta memory:\n")
+        provider_config = {
+            "base_url": _prompt_text("Letta base URL", default="https://letta.example.com"),
+            "agent_name_prefix": _prompt_text("Agent name prefix", default="Hermes Memory"),
+            "project_id": _prompt_text("Project ID (optional)", default=""),
+            "recall_mode": _prompt_text("Recall mode (hybrid/context/tools)", default="hybrid"),
+            "injection_frequency": _prompt_text("Injection frequency (every-turn/first-turn)", default="every-turn"),
+            "first_turn_context_enabled": _prompt_yes_no("Warm first-turn context", default=True),
+            "context_char_limit": int(_prompt_text("Context char limit", default="1200") or "1200"),
+            "context_tokens": int(_prompt_text("Context token budget (0 disables token cap)", default="0") or "0"),
+            "context_cadence": int(_prompt_text("Context cadence (minimum turns between refreshes)", default="1") or "1"),
+            "dialectic_cadence": int(_prompt_text("Query cadence (minimum turns between prefetches)", default="1") or "1"),
+        }
+        api_key = _prompt_text("Letta API key (optional)", default="", secret=True)
+        env_writes: Dict[str, str] = {}
+        if api_key:
+            env_writes["LETTA_API_KEY"] = api_key
+
+        result = self.test_connection({**provider_config, "api_key": api_key})
+        if not result.get("ok"):
+            print(f"\n  ✗ Letta connection failed: {result.get('detail', 'unknown error')}\n")
+            return
+
+        if not isinstance(config.get("memory"), dict):
+            config["memory"] = {}
+        config["memory"]["provider"] = "letta"
+        save_config(config)
+        self.save_config(provider_config, hermes_home)
+        if env_writes:
+            _write_env_vars(Path(hermes_home) / ".env", env_writes)
+
+        self._config = LettaConfig(
+            base_url=provider_config["base_url"],
+            api_key=api_key,
+            project_id=provider_config["project_id"],
+            agent_name_prefix=provider_config["agent_name_prefix"],
+            recall_mode=provider_config["recall_mode"],
+            injection_frequency=provider_config["injection_frequency"],
+            first_turn_context_enabled=provider_config["first_turn_context_enabled"],
+            context_char_limit=provider_config["context_char_limit"],
+            context_tokens=provider_config["context_tokens"],
+            context_cadence=max(1, int(provider_config.get("context_cadence", 1) or 1)),
+            dialectic_cadence=max(1, int(provider_config.get("dialectic_cadence", 1) or 1)),
+        )
+        self._client = LettaClient(self._config)
+        self._canonical_user_id = "setup:migration"
+        self._agent_id = "setup-agent"
+        self._initialized = True
+
+        if _prompt_yes_no("Import existing built-in MEMORY.md and USER.md into Letta now", default=False):
+            migration = self.migrate_builtin_memory(hermes_home)
+            print(f"  ✓ Migration done: imported={migration.get('imported', 0)} skipped={migration.get('skipped', 0)}")
+
+        print("\n  ✓ Letta memory configured and validated\n")
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = LettaConfig.from_global_config()
@@ -290,7 +466,10 @@ class LettaMemoryProvider(MemoryProvider):
         self._initialized = bool(self._agent_id)
         if self._initialized:
             self._write_profile_block()
-            self._refresh_prefetch("session start")
+            if self._config.first_turn_context_enabled and self._config.recall_mode in ("context", "hybrid"):
+                self._refresh_prefetch("session start")
+                with self._prefetch_lock:
+                    self._first_turn_context = self._prefetch_result or ""
 
     def _resolve_canonical_user_id(self, kwargs: Dict[str, Any]) -> str:
         raw_user_id = (kwargs.get("user_id") or "").strip()
@@ -341,16 +520,43 @@ class LettaMemoryProvider(MemoryProvider):
             logger.debug("Letta core memory block update skipped: %s", e)
 
     def system_prompt_block(self) -> str:
-        if not self._initialized:
+        if not self._initialized or not self._config:
             return ""
-        return (
-            "# Letta Memory\n"
-            "Active (memory-service mode). Use letta_profile / letta_search / letta_context / letta_conclude for explicit memory access.\n"
-            "Structured memory types: profile, preference, episodic, summary.\n"
-            "Only durable facts/preferences/project conventions should be written."
-        )
+        if self._config.recall_mode == "context":
+            header = (
+                "# Letta Memory\n"
+                "Active (context-injection mode). Relevant Letta memory is auto-injected. "
+                "No Letta memory tools are available in this mode.\n"
+                "Structured memory types: profile, preference, episodic, summary."
+            )
+        elif self._config.recall_mode == "tools":
+            header = (
+                "# Letta Memory\n"
+                "Active (tools-only mode). Use letta_profile / letta_search / letta_context / letta_conclude for explicit memory access.\n"
+                "Structured memory types: profile, preference, episodic, summary."
+            )
+        else:
+            header = (
+                "# Letta Memory\n"
+                "Active (hybrid mode). Relevant Letta memory is auto-injected and Letta tools are available.\n"
+                "Structured memory types: profile, preference, episodic, summary."
+            )
+        return header + "\nOnly durable facts/preferences/project conventions should be written."
 
-    def _format_memory_record(self, content: str, *, memory_type: str, source: str, confidence: float, project: str = "", session_id: str = "") -> str:
+    def _truncate_context(self, text: str) -> str:
+        limit = self._config.context_char_limit if self._config else 1200
+        token_budget = (self._config.context_tokens * 4) if self._config and self._config.context_tokens else 0
+        if token_budget > 0:
+            limit = min(limit, token_budget) if limit > 0 else token_budget
+        if limit <= 0 or len(text) <= limit:
+            return text
+        shortened = text[:limit]
+        cut = shortened.rfind(" ")
+        if cut > int(limit * 0.7):
+            shortened = shortened[:cut]
+        return shortened.rstrip() + " …"
+
+    def _format_memory_record(self, content: str, *, memory_type: str, source: str, confidence: float, project: str = "", session_id: str = "", metadata: Optional[Dict[str, Any]] = None) -> str:
         payload = {
             "memory_type": memory_type,
             "canonical_user_id": self._canonical_user_id,
@@ -361,12 +567,22 @@ class LettaMemoryProvider(MemoryProvider):
             "session_id": session_id or self._session_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        if metadata:
+            payload["metadata"] = metadata
         return json.dumps(payload, ensure_ascii=False)
 
-    def _store_memory(self, content: str, *, memory_type: str, source: str = "user_explicit", confidence: float = 0.9, project: str = "") -> Dict[str, Any]:
+    def _store_memory(self, content: str, *, memory_type: str, source: str = "user_explicit", confidence: float = 0.9, project: str = "", session_id: str = "", metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not self._initialized or not self._client or not self._agent_id:
             return {"status": "skipped", "reason": "provider not initialized"}
-        text = self._format_memory_record(content, memory_type=memory_type, source=source, confidence=confidence, project=project)
+        text = self._format_memory_record(
+            content,
+            memory_type=memory_type,
+            source=source,
+            confidence=confidence,
+            project=project,
+            session_id=session_id,
+            metadata=metadata,
+        )
         created = self._client.create_passage(self._agent_id, text)
         passage_id = ""
         if isinstance(created, dict):
@@ -448,61 +664,309 @@ class LettaMemoryProvider(MemoryProvider):
         hits = self._search(query, top_k=self._config.prefetch_top_k if self._config else 5)
         text = ""
         if hits:
-            text = "# Letta Relevant Memory\n" + self._render_hits(hits)
+            text = self._truncate_context("# Letta Relevant Memory\n" + self._render_hits(hits))
         with self._prefetch_lock:
             self._prefetch_result = text
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def _should_refresh_for_query(self, query: str) -> bool:
         q = (query or "").strip()
-        if q:
-            lowered = q.lower()
-            if any(tok in lowered for tok in ["remember", "kayak biasa", "seperti biasa", "preference", "prefer", "centracast", "deploy", "vault", "project"]):
-                self._refresh_prefetch(q)
+        if not q:
+            return False
+        lowered = q.lower()
+        if any(tok in lowered for tok in [
+            "remember", "kayak biasa", "seperti biasa", "preference", "prefer",
+            "project", "deploy", "vault", "workflow", "sebelumnya", "lagi",
+            "biasanya", "konteks", "context",
+        ]):
+            return True
+        if len(q) >= 48:
+            return True
+        if len(q.split()) <= 3:
+            return True
+        return False
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if not self._initialized or not self._config:
+            return ""
+        if self._config.recall_mode == "tools":
+            return ""
+        if self._config.injection_frequency == "first-turn" and self._turn_count > 1:
+            return ""
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
-            return self._prefetch_result
+            if self._first_turn_context is not None:
+                result = self._truncate_context(self._first_turn_context)
+                self._first_turn_context = None
+                return result
+            result = self._truncate_context(self._prefetch_result)
+            self._prefetch_result = ""
+            return result
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        if not query:
+        if not query or not self._initialized or not self._config:
             return
-        try:
-            self._refresh_prefetch(query)
-        except Exception:
-            logger.debug("Letta queue_prefetch failed", exc_info=True)
+        if self._config.recall_mode == "tools":
+            return
+        if not self._should_refresh_for_query(query):
+            return
+        if self._config.injection_frequency == "first-turn" and self._turn_count > 1:
+            return
+        if self._config.dialectic_cadence > 1:
+            if (self._turn_count - self._last_dialectic_turn) < self._config.dialectic_cadence:
+                return
+        self._last_dialectic_turn = self._turn_count
+        if self._config.context_cadence > 1:
+            if (self._turn_count - self._last_context_turn) < self._config.context_cadence:
+                return
+        self._last_context_turn = self._turn_count
+
+        def _run() -> None:
+            try:
+                self._refresh_prefetch(query)
+            except Exception:
+                logger.debug("Letta queue_prefetch failed", exc_info=True)
+
+        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="letta-prefetch")
+        self._prefetch_thread.start()
+
+    def _normalize_turn_text(self, text: str) -> str:
+        cleaned = sanitize_context(text or "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _is_transient_turn_text(self, text: str) -> bool:
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return True
+        if len(lowered) < 16:
+            return True
+        transient_exact = {
+            "ok", "oke", "sip", "siap", "thanks", "thank you", "thx", "noted",
+            "mantap", "aman", "gas", "lanjut", "sama-sama",
+        }
+        if lowered in transient_exact:
+            return True
+        if len(lowered.split()) <= 3 and lowered.replace("-", " ") in transient_exact:
+            return True
+        return False
+
+    def _should_store_turn(self, user_text: str, assistant_text: str) -> bool:
+        if self._is_transient_turn_text(user_text) or self._is_transient_turn_text(assistant_text):
+            return False
+        return bool(user_text and assistant_text)
+
+    @staticmethod
+    def _chunk_message(content: str, limit: int) -> list[str]:
+        if len(content) <= limit:
+            return [content]
+
+        prefix = "[continued] "
+        prefix_len = len(prefix)
+        chunks = []
+        remaining = content
+        first = True
+        while remaining:
+            effective = limit if first else limit - prefix_len
+            if len(remaining) <= effective:
+                chunks.append(remaining if first else prefix + remaining)
+                break
+
+            segment = remaining[:effective]
+            cut = segment.rfind("\n\n")
+            if cut < effective * 0.3:
+                cut = segment.rfind(". ")
+                if cut >= 0:
+                    cut += 2
+            if cut < effective * 0.3:
+                cut = segment.rfind(" ")
+            if cut < effective * 0.3:
+                cut = effective
+
+            chunk = remaining[:cut].rstrip()
+            remaining = remaining[cut:].lstrip()
+            if not first:
+                chunk = prefix + chunk
+            chunks.append(chunk)
+            first = False
+
+        return chunks
+
+    def _store_turn_side(
+        self,
+        role: str,
+        text: str,
+        *,
+        turn_index: int,
+        session_id: str = "",
+    ) -> None:
+        chunks = self._chunk_message(text, self._conversation_chunk_chars)
+        chunk_total = len(chunks)
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            self._store_memory(
+                chunk,
+                memory_type="episodic",
+                source="turn_sync",
+                confidence=0.78,
+                session_id=session_id,
+                metadata={
+                    "role": role,
+                    "turn_index": turn_index,
+                    "chunk_index": chunk_index,
+                    "chunk_total": chunk_total,
+                },
+            )
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        return
+        if not self._initialized or not self._config or not self._client or not self._agent_id:
+            return
+        user_text = self._normalize_turn_text(user_content)
+        assistant_text = self._normalize_turn_text(assistant_content)
+        if not self._should_store_turn(user_text, assistant_text):
+            return
+        self._turn_sequence += 1
+        turn_index = self._turn_sequence
+
+        def _sync() -> None:
+            try:
+                self._store_turn_side("user", user_text, turn_index=turn_index, session_id=session_id)
+                self._store_turn_side("assistant", assistant_text, turn_index=turn_index, session_id=session_id)
+            except Exception:
+                logger.debug("Letta sync_turn failed", exc_info=True)
+
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=5.0)
+        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="letta-sync-turn")
+        self._sync_thread.start()
+        self._sync_thread.join(timeout=5.0)
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        self._turn_count = turn_number
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        if self._config and self._config.recall_mode == "context":
+            return []
         return ALL_TOOL_SCHEMAS
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         try:
             if tool_name == "letta_profile":
                 hits = self._search("user profile preferences communication style", top_k=8)
-                return json.dumps({"result": self._render_hits([h for h in hits if h.get('memory_type') in ('profile','preference')])})
+                filtered = [h for h in hits if h.get("memory_type") in ("profile", "preference")]
+                if not filtered:
+                    return json.dumps({"result": "No profile facts available yet."})
+                return json.dumps({"result": self._render_hits(filtered), "items": filtered})
             if tool_name == "letta_search":
+                query = (args.get("query", "") or "").strip()
+                if not query:
+                    return tool_error("Missing required parameter: query")
                 hits = self._search(
-                    args.get("query", ""),
+                    query,
                     top_k=int(args.get("top_k", 5) or 5),
                     memory_type=args.get("memory_type", "") or "",
                     project=args.get("project", "") or "",
                 )
+                if not hits:
+                    return json.dumps({"result": "No relevant context found.", "items": []})
                 return json.dumps({"result": self._render_hits(hits), "items": hits})
             if tool_name == "letta_context":
-                hits = self._search(args.get("query", ""), top_k=6, project=args.get("project", "") or "")
-                return json.dumps({"result": self._render_hits(hits)})
+                query = (args.get("query", "") or "").strip()
+                if not query:
+                    return tool_error("Missing required parameter: query")
+                hits = self._search(query, top_k=6, project=args.get("project", "") or "")
+                if not hits:
+                    return json.dumps({"result": "No relevant context found.", "items": []})
+                return json.dumps({"result": self._render_hits(hits), "items": hits})
             if tool_name == "letta_conclude":
-                result = self._store_memory(
-                    args.get("conclusion", ""),
+                conclusion = (args.get("conclusion", "") or "").strip()
+                if not conclusion:
+                    return tool_error("Missing required parameter: conclusion")
+                stored = self._store_memory(
+                    conclusion,
                     memory_type=args.get("memory_type", "preference") or "preference",
                     project=args.get("project", "") or "",
                     confidence=float(args.get("confidence", 0.9) or 0.9),
                     source=args.get("source", "user_explicit") or "user_explicit",
                 )
+                result = {"result": f"Conclusion saved: {conclusion}"}
+                if isinstance(stored, dict):
+                    result.update(stored)
                 return json.dumps(result)
-            return json.dumps({"error": f"Unknown Letta tool: {tool_name}"})
+            return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return tool_error(str(e))
+
+    def _normalize_memory_entry(self, content: str) -> str:
+        cleaned = sanitize_context(content or "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _entry_hash(self, content: str, memory_type: str) -> str:
+        normalized = self._normalize_memory_entry(content).lower()
+        payload = f"{memory_type}|{normalized}".encode("utf-8")
+        return hashlib.sha1(payload).hexdigest()
+
+    def _load_existing_import_hashes(self) -> set[str]:
+        if not self._client or not self._agent_id:
+            return set()
+        hashes: set[str] = set()
+        try:
+            for row in self._client.list_archival_memory(self._agent_id, limit=500):
+                payload = self._decode_passage(row)
+                if not payload:
+                    continue
+                content = self._normalize_memory_entry(str(payload.get("content", "")))
+                if not content:
+                    continue
+                hashes.add(self._entry_hash(content, str(payload.get("memory_type", "unknown"))))
+        except Exception:
+            logger.debug("Letta migration dedup preload failed", exc_info=True)
+        return hashes
+
+    def _read_builtin_memory_entries(self, base_dir: str, filename: str) -> List[str]:
+        path = Path(base_dir) / "memories" / filename
+        if not path.exists():
+            return []
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except Exception:
+            return []
+        entries = [self._normalize_memory_entry(item) for item in raw.split(ENTRY_DELIMITER)]
+        return [item for item in entries if item]
+
+    def migrate_builtin_memory(self, base_dir: str) -> Dict[str, Any]:
+        if not self._initialized or not self._config or not self._agent_id:
+            return {"imported": 0, "skipped": 0, "reason": "provider not initialized"}
+
+        existing_hashes = self._load_existing_import_hashes()
+        imported = 0
+        skipped = 0
+        plan = [
+            ("USER.md", "profile", 0.95),
+            ("MEMORY.md", "preference", 0.9),
+        ]
+
+        for filename, memory_type, confidence in plan:
+            seen_local: set[str] = set()
+            for entry in self._read_builtin_memory_entries(base_dir, filename):
+                entry_hash = self._entry_hash(entry, memory_type)
+                if entry_hash in existing_hashes or entry_hash in seen_local:
+                    skipped += 1
+                    continue
+                result = self._store_memory(
+                    entry,
+                    memory_type=memory_type,
+                    source="migrated_builtin_memory",
+                    confidence=confidence,
+                )
+                if result.get("status") == "stored":
+                    imported += 1
+                    existing_hashes.add(entry_hash)
+                    seen_local.add(entry_hash)
+                else:
+                    skipped += 1
+
+        return {"imported": imported, "skipped": skipped}
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         if action == "remove" or not content.strip():
@@ -515,6 +979,8 @@ class LettaMemoryProvider(MemoryProvider):
             logger.debug("Letta on_memory_write failed", exc_info=True)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=10.0)
         if not self._config or not self._config.auto_session_summary or not messages:
             return
         user_msgs = []
@@ -534,6 +1000,10 @@ class LettaMemoryProvider(MemoryProvider):
                 logger.debug("Letta session summary write failed", exc_info=True)
 
     def shutdown(self) -> None:
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=5.0)
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=5.0)
         return
 
 

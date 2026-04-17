@@ -687,20 +687,517 @@ class TestLettaMemoryProvider:
         p.initialize("sess-1", platform="telegram", agent_context="cron", user_id="73784266")
         assert p._initialized is False
 
-    def test_letta_prefetch_uses_cached_result_for_recallish_queries(self, monkeypatch):
+    def test_letta_prefetch_returns_warmed_first_turn_context_then_clears(self, monkeypatch):
         from plugins.memory.letta import LettaMemoryProvider, LettaConfig
 
-        monkeypatch.setattr(LettaConfig, "from_global_config", classmethod(lambda cls: LettaConfig(base_url="https://letta.test", prefetch_top_k=3)))
+        monkeypatch.setattr(LettaConfig, "from_global_config", classmethod(lambda cls: LettaConfig(base_url="https://letta.test", prefetch_top_k=3, recall_mode="hybrid", first_turn_context_enabled=True)))
         p = LettaMemoryProvider()
         p._initialized = True
-        p._config = LettaConfig(base_url="https://letta.test", prefetch_top_k=3)
+        p._config = LettaConfig(base_url="https://letta.test", prefetch_top_k=3, recall_mode="hybrid", first_turn_context_enabled=True)
         p._client = object()
         p._agent_id = "agent-123"
-        p._search = lambda query, **kwargs: [{"memory_type": "preference", "project": "centracast", "confidence": 0.9, "content": "Albert wants live runtime verification"}]
+        p._first_turn_context = "# Letta Relevant Memory\n- [preference] Albert wants live runtime verification"
 
-        result = p.prefetch("remember deploy preference for centracast")
+        first = p.prefetch("remember deploy preference for centracast")
+        second = p.prefetch("remember deploy preference for centracast")
+
+        assert "Letta Relevant Memory" in first
+        assert second == ""
+
+    def test_letta_context_mode_hides_tools(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="context")
+
+        assert p.get_tool_schemas() == []
+
+    def test_letta_tools_mode_disables_auto_prefetch_and_queue(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="tools")
+        p._client = object()
+        p._agent_id = "agent-123"
+        called = []
+        p._refresh_prefetch = lambda query: called.append(query)
+
+        p.queue_prefetch("remember deploy preference")
+
+        assert p.prefetch("remember deploy preference") == ""
+        assert called == []
+
+    def test_letta_queue_prefetch_caches_async_result_for_next_turn(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid")
+        p._client = object()
+        p._agent_id = "agent-123"
+        p._search = lambda query, **kwargs: [{"memory_type": "preference", "project": "centracast", "confidence": 0.9, "content": f"hit for {query}"}]
+
+        p.queue_prefetch("remember deploy preference for centracast")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+        result = p.prefetch("anything")
+
         assert "Letta Relevant Memory" in result
-        assert "live runtime verification" in result
+        assert "hit for remember deploy preference for centracast" in result
+        assert p.prefetch("anything") == ""
+
+    def test_letta_queue_prefetch_does_not_skip_short_but_meaningful_query(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid")
+        p._client = object()
+        p._agent_id = "agent-123"
+        calls = []
+        p._refresh_prefetch = lambda query: calls.append(query) or setattr(p, "_prefetch_result", f"# Letta Relevant Memory\\n- [preference] hit for {query}")
+
+        p.queue_prefetch("invoice")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+
+        assert calls == ["invoice"]
+        assert "hit for invoice" in p.prefetch("invoice")
+
+    def test_letta_prefetch_truncates_to_context_token_budget(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", context_char_limit=400, context_tokens=12)
+        p._client = object()
+        p._agent_id = "agent-123"
+        p._prefetch_result = "# Letta Relevant Memory\\n" + ("deploy rollback observability " * 20)
+
+        result = p.prefetch("deploy")
+
+        assert len(result) <= 60
+        assert result.endswith(" …")
+
+    def test_letta_first_turn_injection_frequency_only_injects_once(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid", injection_frequency="first-turn")
+        p._client = object()
+        p._agent_id = "agent-123"
+        p._prefetch_result = "# Letta Relevant Memory\n- [preference] one"
+
+        p.on_turn_start(1, "first")
+        first = p.prefetch("remember")
+        p._prefetch_result = "# Letta Relevant Memory\n- [preference] two"
+        p.on_turn_start(2, "second")
+        second = p.prefetch("remember")
+
+        assert "Letta Relevant Memory" in first
+        assert second == ""
+
+    def test_letta_queue_prefetch_respects_first_turn_injection_frequency(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid", injection_frequency="first-turn")
+        p._client = object()
+        p._agent_id = "agent-123"
+        calls = []
+        p._refresh_prefetch = lambda query: calls.append(query)
+
+        p.on_turn_start(2, "second")
+        p.queue_prefetch("remember deploy")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+
+        assert calls == []
+
+    def test_letta_queue_prefetch_respects_dialectic_cadence(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid", dialectic_cadence=2)
+        p._client = object()
+        p._agent_id = "agent-123"
+        calls = []
+        p._refresh_prefetch = lambda query: calls.append(query)
+
+        p.on_turn_start(1, "first")
+        p.queue_prefetch("remember deploy")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+        p.on_turn_start(2, "second")
+        p.queue_prefetch("remember deploy")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+        p.on_turn_start(3, "third")
+        p.queue_prefetch("remember deploy")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+
+        assert calls == ["remember deploy", "remember deploy"]
+
+    def test_letta_queue_prefetch_respects_context_cadence(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid", context_cadence=3)
+        p._client = object()
+        p._agent_id = "agent-123"
+        calls = []
+        p._refresh_prefetch = lambda query: calls.append(query)
+
+        p.on_turn_start(1, "first")
+        p.queue_prefetch("remember deploy")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+        p.on_turn_start(2, "second")
+        p.queue_prefetch("remember deploy")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+        p.on_turn_start(3, "third")
+        p.queue_prefetch("remember deploy")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+        p.on_turn_start(4, "fourth")
+        p.queue_prefetch("remember deploy")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3)
+
+        assert calls == ["remember deploy", "remember deploy"]
+
+    def test_letta_profile_returns_honcho_style_empty_message(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid")
+        p._client = object()
+        p._agent_id = "agent-123"
+        p._search = lambda query, **kwargs: []
+
+        result = json.loads(p.handle_tool_call("letta_profile", {}))
+
+        assert result["result"] == "No profile facts available yet."
+
+    def test_letta_search_requires_query_and_returns_honcho_style_empty_message(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid")
+        p._client = object()
+        p._agent_id = "agent-123"
+        p._search = lambda query, **kwargs: []
+
+        missing = json.loads(p.handle_tool_call("letta_search", {}))
+        empty = json.loads(p.handle_tool_call("letta_search", {"query": "billing"}))
+
+        assert missing["error"] == "Missing required parameter: query"
+        assert empty["result"] == "No relevant context found."
+
+    def test_letta_context_requires_query_and_returns_honcho_style_empty_message(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid")
+        p._client = object()
+        p._agent_id = "agent-123"
+        p._search = lambda query, **kwargs: []
+
+        missing = json.loads(p.handle_tool_call("letta_context", {}))
+        empty = json.loads(p.handle_tool_call("letta_context", {"query": "billing"}))
+
+        assert missing["error"] == "Missing required parameter: query"
+        assert empty["result"] == "No relevant context found."
+
+    def test_letta_conclude_requires_conclusion_and_returns_saved_message(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid")
+        p._client = object()
+        p._agent_id = "agent-123"
+        p._store_memory = lambda *args, **kwargs: {"status": "stored", "id": "passage-1", "memory_type": "preference"}
+
+        missing = json.loads(p.handle_tool_call("letta_conclude", {}))
+        saved = json.loads(p.handle_tool_call("letta_conclude", {"conclusion": "Albert prefers direct execution"}))
+
+        assert missing["error"] == "Missing required parameter: conclusion"
+        assert saved["result"] == "Conclusion saved: Albert prefers direct execution"
+        assert saved["id"] == "passage-1"
+
+    def test_letta_unknown_tool_returns_honcho_style_error(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", recall_mode="hybrid")
+
+        result = json.loads(p.handle_tool_call("letta_unknown", {}))
+
+        assert result["error"] == "Unknown tool: letta_unknown"
+
+    def test_letta_sync_turn_stores_every_non_transient_turn_for_continuity(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test")
+        p._client = object()
+        p._agent_id = "agent-123"
+        stored = []
+        p._store_memory = lambda content, **kwargs: stored.append({"content": content, **kwargs}) or {"status": "stored"}
+
+        p.sync_turn(
+            "Tolong cek branch staging sekarang dan pastikan route billing invoice masih kebuka.",
+            "Siap, gue cek branch staging dan verifikasi route billing invoice sebelum bilang aman.",
+            session_id="sess-42",
+        )
+
+        assert len(stored) == 2
+        assert [item["memory_type"] for item in stored] == ["episodic", "episodic"]
+        assert all(item["source"] == "turn_sync" for item in stored)
+        assert all(item["session_id"] == "sess-42" for item in stored)
+        assert all(item["confidence"] == pytest.approx(0.78) for item in stored)
+        assert [item["metadata"]["role"] for item in stored] == ["user", "assistant"]
+        assert [item["metadata"]["turn_index"] for item in stored] == [1, 1]
+        assert all("billing invoice" in item["content"].lower() for item in stored)
+
+    def test_letta_sync_turn_does_not_require_durable_markers_for_continuity(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test")
+        p._client = object()
+        p._agent_id = "agent-123"
+        stored = []
+        p._store_memory = lambda content, **kwargs: stored.append({"content": content, **kwargs}) or {"status": "stored"}
+
+        p.sync_turn(
+            "Cek kenapa tombol submit POS nggak memicu request di live runtime.",
+            "Oke, gue trace event delivery tombol submit POS di runtime live sekarang.",
+        )
+
+        assert len(stored) == 2
+        assert [item["metadata"]["role"] for item in stored] == ["user", "assistant"]
+        assert [item["metadata"]["turn_index"] for item in stored] == [1, 1]
+        assert "tombol submit pos" in stored[0]["content"].lower()
+        assert "event delivery" in stored[1]["content"].lower()
+
+    def test_letta_sync_turn_preserves_long_turn_content_without_truncating_to_context_limit(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test", context_char_limit=120)
+        p._client = object()
+        p._agent_id = "agent-123"
+        stored = []
+        p._store_memory = lambda content, **kwargs: stored.append({"content": content, **kwargs}) or {"status": "stored"}
+
+        repeated = "deploy verification rollback observability " * 12
+        p.sync_turn(
+            f"Tolong catat {repeated}",
+            f"Siap, gue catat {repeated}",
+        )
+
+        assert len(stored) == 2
+        assert all(" …" not in item["content"] for item in stored)
+        assert stored[0]["content"].count("deploy verification rollback observability") >= 6
+        assert stored[1]["content"].count("deploy verification rollback observability") >= 6
+
+    def test_letta_on_session_end_waits_for_pending_sync_thread(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        class DummyThread:
+            def __init__(self):
+                self.join_calls = []
+
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                self.join_calls.append(timeout)
+
+        p = LettaMemoryProvider()
+        p._config = LettaConfig(base_url="https://letta.test", auto_session_summary=False)
+        p._sync_thread = DummyThread()
+
+        p.on_session_end([{"role": "user", "content": "hi"}])
+
+        assert p._sync_thread.join_calls == [10.0]
+
+    def test_letta_shutdown_waits_for_pending_sync_thread(self):
+        from plugins.memory.letta import LettaMemoryProvider
+
+        class DummyThread:
+            def __init__(self):
+                self.join_calls = []
+
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                self.join_calls.append(timeout)
+
+        p = LettaMemoryProvider()
+        p._sync_thread = DummyThread()
+
+        p.shutdown()
+
+        assert p._sync_thread.join_calls == [5.0]
+
+    def test_letta_sync_turn_skips_short_or_transient_turns(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test")
+        p._client = object()
+        p._agent_id = "agent-123"
+        stored = []
+        p._store_memory = lambda content, **kwargs: stored.append({"content": content, **kwargs}) or {"status": "stored"}
+
+        p.sync_turn("ok", "sip")
+        p.sync_turn("thanks banget", "sama-sama")
+
+        assert stored == []
+
+    def test_letta_sync_turn_sanitizes_memory_context_fence_markers(self):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test")
+        p._client = object()
+        p._agent_id = "agent-123"
+        stored = []
+        p._store_memory = lambda content, **kwargs: stored.append({"content": content, **kwargs}) or {"status": "stored"}
+
+        p.sync_turn(
+            "Pakai ini ya <memory-context>jangan ikut kesimpan</memory-context> deploy tetap wajib live verification dan rollback plan.",
+            "Siap, gue pegang deploy wajib live verification plus rollback plan.",
+        )
+
+        assert len(stored) == 2
+        assert all("<memory-context>" not in item["content"].lower() for item in stored)
+        assert all("</memory-context>" not in item["content"].lower() for item in stored)
+
+    def test_letta_migrate_builtin_memory_imports_user_and_memory_entries(self, tmp_path):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        memories = tmp_path / "memories"
+        memories.mkdir()
+        (memories / "USER.md").write_text("Albert prefers direct execution\n§\nAlbert likes evidence-first updates\n", encoding="utf-8")
+        (memories / "MEMORY.md").write_text("MIT deploy target is 10.0.0.21\n§\nNever stop paperclip.service unless told\n", encoding="utf-8")
+        (tmp_path / "SOUL.md").write_text("should not be imported", encoding="utf-8")
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test")
+        p._client = object()
+        p._agent_id = "agent-123"
+        stored = []
+        p._store_memory = lambda content, **kwargs: stored.append({"content": content, **kwargs}) or {"status": "stored"}
+
+        result = p.migrate_builtin_memory(str(tmp_path))
+
+        assert result["imported"] == 4
+        assert result["skipped"] == 0
+        assert [item["memory_type"] for item in stored] == ["profile", "profile", "preference", "preference"]
+        assert all(item["source"] == "migrated_builtin_memory" for item in stored)
+        assert all("should not be imported" not in item["content"] for item in stored)
+
+    def test_letta_migrate_builtin_memory_skips_duplicates_using_existing_archival_memory(self, tmp_path):
+        from plugins.memory.letta import LettaMemoryProvider, LettaConfig
+
+        memories = tmp_path / "memories"
+        memories.mkdir()
+        (memories / "USER.md").write_text("Albert prefers direct execution\n§\nAlbert prefers direct execution\n", encoding="utf-8")
+        (memories / "MEMORY.md").write_text("MIT deploy target is 10.0.0.21\n", encoding="utf-8")
+
+        class DummyClient:
+            def list_archival_memory(self, agent_id, limit=100):
+                return [
+                    {
+                        "text": '{"memory_type":"profile","content":"Albert prefers direct execution","source":"migrated_builtin_memory"}'
+                    }
+                ]
+
+        p = LettaMemoryProvider()
+        p._initialized = True
+        p._config = LettaConfig(base_url="https://letta.test")
+        p._client = DummyClient()
+        p._agent_id = "agent-123"
+        stored = []
+        p._store_memory = lambda content, **kwargs: stored.append({"content": content, **kwargs}) or {"status": "stored"}
+
+        result = p.migrate_builtin_memory(str(tmp_path))
+
+        assert result["imported"] == 1
+        assert result["skipped"] == 2
+        assert len(stored) == 1
+        assert stored[0]["memory_type"] == "preference"
+
+    def test_letta_post_setup_saves_config_and_runs_optional_migration(self, monkeypatch, tmp_path):
+        import plugins.memory.letta as letta_module
+        from plugins.memory.letta import LettaMemoryProvider
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        memories = hermes_home / "memories"
+        memories.mkdir()
+        (memories / "USER.md").write_text("Albert prefers direct execution\n", encoding="utf-8")
+        (memories / "MEMORY.md").write_text("MIT deploy target is 10.0.0.21\n", encoding="utf-8")
+
+        provider = LettaMemoryProvider()
+        config = {"memory": {}}
+        saved_provider_configs = []
+        saved_global_configs = []
+        env_writes = []
+        migrated = []
+        answers = iter([
+            "https://letta.test",
+            "Hermes Memory",
+            "proj-123",
+            "hybrid",
+            "every-turn",
+            "y",
+            "1200",
+            "0",
+            "1",
+            "1",
+            "",
+            "y",
+        ])
+
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved_global_configs.append(cfg.copy()))
+        monkeypatch.setattr(provider, "save_config", lambda values, home: saved_provider_configs.append((values.copy(), home)))
+        monkeypatch.setattr(provider, "test_connection", lambda values: {"ok": True, "detail": "reachable"})
+        monkeypatch.setattr(provider, "migrate_builtin_memory", lambda home: migrated.append(home) or {"imported": 2, "skipped": 0})
+        monkeypatch.setattr(letta_module, "_prompt_text", lambda label, default=None, secret=False: next(answers))
+        monkeypatch.setattr(letta_module, "_prompt_yes_no", lambda label, default=False: next(answers).lower() in {"y", "yes"})
+        monkeypatch.setattr(letta_module, "_write_env_vars", lambda env_path, writes: env_writes.append((str(env_path), writes.copy())))
+
+        provider.post_setup(str(hermes_home), config)
+
+        assert config["memory"]["provider"] == "letta"
+        assert saved_global_configs
+        assert saved_provider_configs[0][0]["base_url"] == "https://letta.test"
+        assert saved_provider_configs[0][0]["project_id"] == "proj-123"
+        assert migrated == [str(hermes_home)]
 
 # ---------------------------------------------------------------------------
 # Context fencing regression tests (salvaged from PR #5339 by lance0)

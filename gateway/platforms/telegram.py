@@ -1079,7 +1079,16 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
         except Exception as e:
-            logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
+            logger.error(
+                "[%s] Failed to send Telegram message chat_id=%s reply_to=%s thread_id=%s dedup_key=%s: %s",
+                self.name,
+                chat_id,
+                locals().get("reply_to_id"),
+                locals().get("effective_thread_id"),
+                dedup_key[:12],
+                e,
+                exc_info=True,
+            )
             # TimedOut means the request may have reached Telegram —
             # mark as non-retryable so _send_with_retry() doesn't re-send.
             _to = locals().get("_TimedOut")

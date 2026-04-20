@@ -10,6 +10,7 @@ The fix detects "thread not found" BadRequest errors and retries the send
 WITHOUT message_thread_id so the message still reaches the chat.
 """
 
+import logging
 import sys
 import types
 from types import SimpleNamespace
@@ -116,9 +117,10 @@ async def test_send_retries_without_thread_on_thread_not_found():
 
 
 @pytest.mark.asyncio
-async def test_send_raises_on_other_bad_request():
+async def test_send_raises_on_other_bad_request(caplog):
     """Non-thread BadRequest errors should NOT be retried — they fail immediately."""
     adapter = _make_adapter()
+    caplog.set_level(logging.ERROR)
 
     async def mock_send_message(**kwargs):
         raise FakeBadRequest("Chat not found")
@@ -133,6 +135,7 @@ async def test_send_raises_on_other_bad_request():
 
     assert result.success is False
     assert "Chat not found" in result.error
+    assert "Failed to send Telegram message chat_id=123 reply_to=None thread_id=99999" in caplog.text
 
 
 @pytest.mark.asyncio

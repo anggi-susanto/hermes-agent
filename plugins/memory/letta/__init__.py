@@ -32,7 +32,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from urllib import error, parse, request
 
 
@@ -799,22 +799,27 @@ class LettaMemoryProvider(MemoryProvider):
         *,
         turn_index: int,
         session_id: str = "",
+        source: str = "turn_sync",
+        extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         chunks = self._chunk_message(text, self._conversation_chunk_chars)
         chunk_total = len(chunks)
         for chunk_index, chunk in enumerate(chunks, start=1):
+            metadata = {
+                "role": role,
+                "turn_index": turn_index,
+                "chunk_index": chunk_index,
+                "chunk_total": chunk_total,
+            }
+            if extra_metadata:
+                metadata.update(extra_metadata)
             self._store_memory(
                 chunk,
                 memory_type="episodic",
-                source="turn_sync",
+                source=source,
                 confidence=0.78,
                 session_id=session_id,
-                metadata={
-                    "role": role,
-                    "turn_index": turn_index,
-                    "chunk_index": chunk_index,
-                    "chunk_total": chunk_total,
-                },
+                metadata=metadata,
             )
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
@@ -906,6 +911,31 @@ class LettaMemoryProvider(MemoryProvider):
         payload = f"{memory_type}|{normalized}".encode("utf-8")
         return hashlib.sha1(payload).hexdigest()
 
+    def _history_entry_key(self, session_id: str, role: str, content: str) -> str:
+        normalized = self._normalize_memory_entry(content).lower()
+        payload = f"{session_id}|{role}|{normalized}".encode("utf-8")
+        return hashlib.sha1(payload).hexdigest()
+
+    def _load_existing_migrated_history_keys(self) -> set[str]:
+        if not self._client or not self._agent_id:
+            return set()
+        keys: set[str] = set()
+        try:
+            for row in self._client.list_archival_memory(self._agent_id, limit=10000):
+                payload = self._decode_passage(row)
+                if not payload or payload.get("source") != "migrated_session_history":
+                    continue
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                role = str(metadata.get("role") or "")
+                session_id = str(payload.get("session_id") or "")
+                content = self._normalize_memory_entry(str(payload.get("content", "")))
+                if not role or not session_id or not content:
+                    continue
+                keys.add(self._history_entry_key(session_id, role, content))
+        except Exception:
+            logger.debug("Letta migration history dedup preload failed", exc_info=True)
+        return keys
+
     def _load_existing_import_hashes(self) -> set[str]:
         if not self._client or not self._agent_id:
             return set()
@@ -967,6 +997,185 @@ class LettaMemoryProvider(MemoryProvider):
                     skipped += 1
 
         return {"imported": imported, "skipped": skipped}
+
+    def _iter_state_db_turns(
+        self,
+        db_path: str,
+        *,
+        include_sources: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        from hermes_state import SessionDB
+
+        selected_sources = tuple(include_sources or ("telegram", "cli"))
+        db = SessionDB(db_path=Path(db_path))
+        sessions = db.search_sessions(limit=100000)
+        scanned = 0
+        skipped = 0
+        selected = 0
+        turns: List[Dict[str, Any]] = []
+
+        for session in sessions:
+            scanned += 1
+            session_source = str(session.get("source") or "")
+            if session_source not in selected_sources:
+                skipped += 1
+                continue
+
+            messages = db.get_messages(session["id"])
+            pending_user: Optional[Dict[str, Any]] = None
+            session_turns = 0
+
+            for msg in messages:
+                role = str(msg.get("role") or "")
+                content = self._normalize_turn_text(str(msg.get("content") or ""))
+                if not content:
+                    continue
+                if role == "user":
+                    if self._is_transient_turn_text(content):
+                        pending_user = None
+                        continue
+                    pending_user = msg | {"content": content}
+                    continue
+                if role != "assistant" or pending_user is None:
+                    continue
+                if self._is_transient_turn_text(content):
+                    pending_user = None
+                    continue
+
+                session_turns += 1
+                turns.append(
+                    {
+                        "session_id": session["id"],
+                        "session_source": session_source,
+                        "session_user_id": session.get("user_id") or "",
+                        "session_title": session.get("title") or "",
+                        "user": pending_user["content"],
+                        "assistant": content,
+                        "turn_index": session_turns,
+                        "user_timestamp": pending_user.get("timestamp"),
+                        "assistant_timestamp": msg.get("timestamp"),
+                    }
+                )
+                pending_user = None
+
+            if session_turns > 0:
+                selected += 1
+            else:
+                skipped += 1
+
+        return {
+            "sessions_scanned": scanned,
+            "sessions_selected": selected,
+            "skipped_sessions": skipped,
+            "turns": turns,
+        }
+
+    def migrate_state_db_history(
+        self,
+        db_path: str,
+        *,
+        target_canonical_user_id: str,
+        include_sources: Optional[Sequence[str]] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        report = self._iter_state_db_turns(db_path, include_sources=include_sources)
+        turns = report.pop("turns")
+        if dry_run:
+            return {
+                "dry_run": True,
+                **report,
+                "estimated_sessions": report["sessions_selected"],
+                "estimated_turns": len(turns),
+                "estimated_passages": len(turns) * 2,
+                "target_canonical_user_id": target_canonical_user_id,
+            }
+
+        if not self._initialized or not self._config or not self._client:
+            return {
+                "dry_run": False,
+                **report,
+                "imported_sessions": 0,
+                "imported_turns": 0,
+                "stored_passages": 0,
+                "target_canonical_user_id": target_canonical_user_id,
+                "reason": "provider not initialized",
+            }
+
+        self._canonical_user_id = target_canonical_user_id.strip() or self._canonical_user_id
+        self._agent_id = self._ensure_agent()
+        self._initialized = bool(self._agent_id)
+        if not self._initialized:
+            return {
+                "dry_run": False,
+                **report,
+                "imported_sessions": 0,
+                "imported_turns": 0,
+                "stored_passages": 0,
+                "target_canonical_user_id": self._canonical_user_id,
+                "reason": "target Letta agent unavailable",
+            }
+
+        stored_passages = 0
+        imported_turns = 0
+        imported_sessions: set[str] = set()
+        existing_history_keys = self._load_existing_migrated_history_keys()
+
+        for turn in turns:
+            session_id = str(turn["session_id"])
+            turn_index = int(turn["turn_index"])
+            shared_metadata = {
+                "session_source": turn["session_source"],
+                "session_user_id": turn["session_user_id"],
+                "session_title": turn["session_title"],
+            }
+            pending_chunks: list[tuple[str, str, Dict[str, Any]]] = []
+
+            for role, text, original_timestamp in (
+                ("user", turn["user"], turn["user_timestamp"]),
+                ("assistant", turn["assistant"], turn["assistant_timestamp"]),
+            ):
+                chunks = self._chunk_message(text, self._conversation_chunk_chars)
+                chunk_total = len(chunks)
+                for chunk_index, chunk in enumerate(chunks, start=1):
+                    chunk_key = self._history_entry_key(session_id, role, chunk)
+                    if chunk_key in existing_history_keys:
+                        continue
+                    metadata = {
+                        "role": role,
+                        "turn_index": turn_index,
+                        "chunk_index": chunk_index,
+                        "chunk_total": chunk_total,
+                        **shared_metadata,
+                        "original_timestamp": original_timestamp,
+                    }
+                    pending_chunks.append((role, chunk, metadata))
+
+            if not pending_chunks:
+                continue
+
+            for role, chunk, metadata in pending_chunks:
+                self._store_memory(
+                    chunk,
+                    memory_type="episodic",
+                    source="migrated_session_history",
+                    confidence=0.78,
+                    session_id=session_id,
+                    metadata=metadata,
+                )
+                stored_passages += 1
+                existing_history_keys.add(self._history_entry_key(session_id, role, chunk))
+
+            imported_turns += 1
+            imported_sessions.add(session_id)
+
+        return {
+            "dry_run": False,
+            **report,
+            "imported_sessions": len(imported_sessions),
+            "imported_turns": imported_turns,
+            "stored_passages": stored_passages,
+            "target_canonical_user_id": self._canonical_user_id,
+        }
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         if action == "remove" or not content.strip():

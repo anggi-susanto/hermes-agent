@@ -94,20 +94,26 @@ class TestHonchoDoctorConfigDetection:
 
 class TestLettaDoctorConfigDetection:
     def test_reports_configured_when_enabled_with_base_url(self, monkeypatch):
+        import plugins.memory.letta as letta_module
+
         fake_config = SimpleNamespace(enabled=True, base_url="https://letta.test")
 
         monkeypatch.setattr(
-            "plugins.memory.letta.LettaConfig.from_global_config",
+            letta_module.LettaConfig,
+            "from_global_config",
             classmethod(lambda cls: fake_config),
         )
 
         assert doctor._letta_is_configured_for_doctor()
 
     def test_reports_not_configured_without_base_url(self, monkeypatch):
+        import plugins.memory.letta as letta_module
+
         fake_config = SimpleNamespace(enabled=True, base_url="")
 
         monkeypatch.setattr(
-            "plugins.memory.letta.LettaConfig.from_global_config",
+            letta_module.LettaConfig,
+            "from_global_config",
             classmethod(lambda cls: fake_config),
         )
 

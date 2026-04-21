@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import threading
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -286,6 +287,10 @@ class LettaClient:
     def list_archival_memory(self, agent_id: str, *, limit: int = 100) -> List[Dict[str, Any]]:
         data = self._request("GET", f"/v1/agents/{agent_id}/archival-memory", params={"limit": limit})
         return data if isinstance(data, list) else []
+
+    def delete_archival_memory(self, agent_id: str, memory_id: str) -> Dict[str, Any]:
+        data = self._request("DELETE", f"/v1/agents/{agent_id}/archival-memory/{memory_id}")
+        return data if isinstance(data, dict) else {"deleted": True}
 
     def search_archival_memory(self, agent_id: str, *, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         data = self._request("GET", f"/v1/agents/{agent_id}/archival-memory/search", params={"query": query, "top_k": top_k})
@@ -1070,6 +1075,127 @@ class LettaMemoryProvider(MemoryProvider):
             "turns": turns,
         }
 
+    def _ensure_migration_agent(self, target_canonical_user_id: str) -> bool:
+        if not self._config:
+            self._config = LettaConfig.from_global_config()
+        if not self._config or not self._config.base_url:
+            return False
+        if not self._client:
+            self._client = LettaClient(self._config)
+        self._initialized = True
+        self._canonical_user_id = target_canonical_user_id.strip() or self._canonical_user_id
+        self._agent_id = self._ensure_agent()
+        self._initialized = bool(self._agent_id)
+        return self._initialized
+
+    def audit_state_db_history_migration(
+        self,
+        db_path: str,
+        *,
+        target_canonical_user_id: str,
+        include_sources: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        report = self._iter_state_db_turns(db_path, include_sources=include_sources)
+        turns = report.pop("turns")
+        expected_keys: Counter[str] = Counter()
+        for turn in turns:
+            session_id = str(turn["session_id"])
+            for role, text in (("user", turn["user"]), ("assistant", turn["assistant"])):
+                for chunk in self._chunk_message(text, self._conversation_chunk_chars):
+                    expected_keys[self._history_entry_key(session_id, role, chunk)] += 1
+
+        if not self._ensure_migration_agent(target_canonical_user_id):
+            return {
+                **report,
+                "expected_turns": len(turns),
+                "expected_chunk_rows": sum(expected_keys.values()),
+                "expected_unique_keys": len(expected_keys),
+                "current_migrated_rows": 0,
+                "current_unique_keys": 0,
+                "duplicate_existing_rows": 0,
+                "missing_expected_keys": len(expected_keys),
+                "extra_unexpected_keys": 0,
+                "target_canonical_user_id": target_canonical_user_id,
+                "reason": "provider not initialized",
+            }
+
+        current_keys: Counter[str] = Counter()
+        for row in self._client.list_archival_memory(self._agent_id, limit=10000):
+            payload = self._decode_passage(row)
+            if not payload or payload.get("source") != "migrated_session_history":
+                continue
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            role = str(metadata.get("role") or "")
+            session_id = str(payload.get("session_id") or "")
+            content = str(payload.get("content") or "")
+            if not role or not session_id or not content:
+                continue
+            current_keys[self._history_entry_key(session_id, role, content)] += 1
+
+        return {
+            **report,
+            "expected_turns": len(turns),
+            "expected_chunk_rows": sum(expected_keys.values()),
+            "expected_unique_keys": len(expected_keys),
+            "current_migrated_rows": sum(current_keys.values()),
+            "current_unique_keys": len(current_keys),
+            "duplicate_existing_rows": sum(count - 1 for count in current_keys.values() if count > 1),
+            "missing_expected_keys": sum(1 for key in expected_keys if key not in current_keys),
+            "extra_unexpected_keys": sum(1 for key in current_keys if key not in expected_keys),
+            "target_canonical_user_id": self._canonical_user_id,
+        }
+
+    def cleanup_migrated_history_duplicates(
+        self,
+        *,
+        target_canonical_user_id: str,
+    ) -> Dict[str, Any]:
+        if not self._ensure_migration_agent(target_canonical_user_id):
+            return {
+                "deleted_rows": 0,
+                "duplicate_groups": 0,
+                "target_canonical_user_id": target_canonical_user_id,
+                "reason": "provider not initialized",
+            }
+
+        duplicate_groups = 0
+        deleted_rows = 0
+        grouped_rows: Dict[str, List[Dict[str, Any]]] = {}
+        for row in self._client.list_archival_memory(self._agent_id, limit=10000):
+            payload = self._decode_passage(row)
+            if not payload or payload.get("source") != "migrated_session_history":
+                continue
+            row_id = str(row.get("id") or "")
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            role = str(metadata.get("role") or "")
+            session_id = str(payload.get("session_id") or "")
+            content = str(payload.get("content") or "")
+            if not row_id or not role or not session_id or not content:
+                continue
+            key = self._history_entry_key(session_id, role, content)
+            grouped_rows.setdefault(key, []).append(
+                {
+                    "row_id": row_id,
+                    "created_at": str(payload.get("created_at") or ""),
+                    "chunk_index": int(metadata.get("chunk_index") or 0),
+                }
+            )
+
+        for items in grouped_rows.values():
+            if len(items) <= 1:
+                continue
+            duplicate_groups += 1
+            items.sort(key=lambda item: (item["created_at"], item["chunk_index"], item["row_id"]))
+            for item in items[1:]:
+                self._client.delete_archival_memory(self._agent_id, item["row_id"])
+                deleted_rows += 1
+
+        return {
+            "deleted_rows": deleted_rows,
+            "duplicate_groups": duplicate_groups,
+            "target_canonical_user_id": self._canonical_user_id,
+        }
+
     def migrate_state_db_history(
         self,
         db_path: str,
@@ -1090,7 +1216,9 @@ class LettaMemoryProvider(MemoryProvider):
                 "target_canonical_user_id": target_canonical_user_id,
             }
 
-        if not self._initialized or not self._config or not self._client:
+        if not self._config:
+            self._config = LettaConfig.from_global_config()
+        if not self._config or not self._config.base_url:
             return {
                 "dry_run": False,
                 **report,
@@ -1101,17 +1229,17 @@ class LettaMemoryProvider(MemoryProvider):
                 "reason": "provider not initialized",
             }
 
-        self._canonical_user_id = target_canonical_user_id.strip() or self._canonical_user_id
-        self._agent_id = self._ensure_agent()
-        self._initialized = bool(self._agent_id)
-        if not self._initialized:
+        if not self._client:
+            self._client = LettaClient(self._config)
+
+        if not self._ensure_migration_agent(target_canonical_user_id):
             return {
                 "dry_run": False,
                 **report,
                 "imported_sessions": 0,
                 "imported_turns": 0,
                 "stored_passages": 0,
-                "target_canonical_user_id": self._canonical_user_id,
+                "target_canonical_user_id": target_canonical_user_id,
                 "reason": "target Letta agent unavailable",
             }
 

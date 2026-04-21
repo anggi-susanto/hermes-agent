@@ -5386,6 +5386,36 @@ Examples:
     memory_sub.add_parser("setup", help="Interactive provider selection and configuration")
     memory_sub.add_parser("status", help="Show current memory provider config")
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
+    memory_migrate = memory_sub.add_parser("migrate", help="Audit, resume, and clean up Letta state.db history migration")
+    memory_migrate_sub = memory_migrate.add_subparsers(dest="migrate_action")
+
+    for action, help_text in (
+        ("audit", "Compare state.db coverage against Letta migrated_session_history rows"),
+        ("resume", "Resume/backfill state.db history into Letta"),
+        ("cleanup", "Delete duplicate Letta migrated_session_history rows"),
+    ):
+        subparser = memory_migrate_sub.add_parser(action, help=help_text)
+        if action in {"audit", "resume"}:
+            subparser.add_argument(
+                "--state-db",
+                default=None,
+                help="Path to Hermes state.db (default: <HERMES_HOME>/state.db)",
+            )
+            subparser.add_argument(
+                "--sources",
+                default="telegram,cli",
+                help="Comma-separated session sources to include (default: telegram,cli)",
+            )
+        subparser.add_argument(
+            "--user-id",
+            default="owner:73784266",
+            help="Canonical Letta user id target (default: owner:73784266)",
+        )
+        subparser.add_argument(
+            "--json",
+            action="store_true",
+            help="Print machine-readable JSON report",
+        )
 
     def cmd_memory(args):
         sub = getattr(args, "memory_command", None)

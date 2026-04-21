@@ -145,6 +145,122 @@ class TestLettaHistoryMigration:
         assert result["imported_turns"] == 0
         assert result["stored_passages"] == 0
 
+    def test_audit_state_db_history_migration_reports_duplicates_and_missing_keys(self, tmp_path, monkeypatch):
+        db, db_path = self._build_db(tmp_path)
+        db.create_session("tg-1", "telegram", user_id="73784266")
+        db.append_message("tg-1", "user", "Please inspect the deploy lane.")
+        db.append_message("tg-1", "assistant", "I will inspect the deploy lane now.")
+
+        provider = self._provider()
+        provider._conversation_chunk_chars = 40
+        chunks = provider._chunk_message("Please inspect the deploy lane.", provider._conversation_chunk_chars)
+
+        class DummyClient:
+            def list_archival_memory(self, agent_id, limit=100):
+                return [
+                    {
+                        "id": "row-1",
+                        "text": json.dumps(
+                            {
+                                "memory_type": "episodic",
+                                "content": chunks[0],
+                                "source": "migrated_session_history",
+                                "session_id": "tg-1",
+                                "metadata": {"role": "user"},
+                            }
+                        ),
+                    },
+                    {
+                        "id": "row-2",
+                        "text": json.dumps(
+                            {
+                                "memory_type": "episodic",
+                                "content": chunks[0],
+                                "source": "migrated_session_history",
+                                "session_id": "tg-1",
+                                "metadata": {"role": "user"},
+                            }
+                        ),
+                    },
+                ]
+
+        provider._client = DummyClient()
+        monkeypatch.setattr(provider, "_ensure_agent", lambda: "agent-unified")
+
+        result = provider.audit_state_db_history_migration(
+            str(db_path),
+            target_canonical_user_id="owner:73784266",
+        )
+
+        assert result["sessions_selected"] == 1
+        assert result["expected_turns"] == 1
+        assert result["duplicate_existing_rows"] == 1
+        assert result["missing_expected_keys"] == 1
+        assert result["extra_unexpected_keys"] == 0
+        assert result["target_canonical_user_id"] == "owner:73784266"
+
+    def test_cleanup_migrated_history_duplicates_deletes_only_extra_rows(self, monkeypatch):
+        provider = self._provider()
+
+        deleted = []
+
+        class DummyClient:
+            def list_archival_memory(self, agent_id, limit=100):
+                return [
+                    {
+                        "id": "row-1",
+                        "text": json.dumps(
+                            {
+                                "memory_type": "episodic",
+                                "content": "same chunk",
+                                "source": "migrated_session_history",
+                                "session_id": "tg-1",
+                                "created_at": "2026-01-01T00:00:00+00:00",
+                                "metadata": {"role": "user", "chunk_index": 1},
+                            }
+                        ),
+                    },
+                    {
+                        "id": "row-2",
+                        "text": json.dumps(
+                            {
+                                "memory_type": "episodic",
+                                "content": "same chunk",
+                                "source": "migrated_session_history",
+                                "session_id": "tg-1",
+                                "created_at": "2026-01-02T00:00:00+00:00",
+                                "metadata": {"role": "user", "chunk_index": 1},
+                            }
+                        ),
+                    },
+                    {
+                        "id": "row-3",
+                        "text": json.dumps(
+                            {
+                                "memory_type": "episodic",
+                                "content": "unique chunk",
+                                "source": "migrated_session_history",
+                                "session_id": "tg-1",
+                                "created_at": "2026-01-03T00:00:00+00:00",
+                                "metadata": {"role": "assistant", "chunk_index": 1},
+                            }
+                        ),
+                    },
+                ]
+
+            def delete_archival_memory(self, agent_id, memory_id):
+                deleted.append((agent_id, memory_id))
+                return {"deleted": True}
+
+        provider._client = DummyClient()
+        monkeypatch.setattr(provider, "_ensure_agent", lambda: "agent-unified")
+
+        result = provider.cleanup_migrated_history_duplicates(target_canonical_user_id="owner:73784266")
+
+        assert result["deleted_rows"] == 1
+        assert result["duplicate_groups"] == 1
+        assert deleted == [("agent-unified", "row-2")]
+
     def test_migrate_state_db_history_dry_run_reports_counts_without_writing(self, tmp_path, monkeypatch):
         db, db_path = self._build_db(tmp_path)
         db.create_session("tg-1", "telegram", user_id="73784266")

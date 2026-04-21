@@ -8,11 +8,14 @@ the provider's config schema. Writes config to config.yaml + .env.
 from __future__ import annotations
 
 import getpass
+import json
 import os
 import sys
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_cli.config import load_config
+from plugins.memory import load_memory_provider
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +439,77 @@ def cmd_status(args) -> None:
     print()
 
 
+def _parse_sources(raw: str | None) -> list[str]:
+    values = [item.strip() for item in (raw or "telegram,cli").split(",")]
+    return [item for item in values if item]
+
+
+def _load_active_letta_provider():
+    config = load_config()
+    mem_config = config.get("memory", {}) if isinstance(config, dict) else {}
+    provider_name = mem_config.get("provider", "") if isinstance(mem_config, dict) else ""
+    if provider_name != "letta":
+        print("\n  Letta must be the active memory provider for migration commands.")
+        print("  Run 'hermes memory setup letta' or 'hermes memory setup' first.\n")
+        return None
+
+    provider = load_memory_provider("letta")
+    if not provider:
+        print("\n  Letta memory provider could not be loaded.\n")
+        return None
+    return provider
+
+
+def _print_migration_report(title: str, report: dict, *, as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return
+
+    print(f"\n{title}\n" + "─" * 40)
+    for key, value in report.items():
+        print(f"  {key}: {value}")
+    print()
+
+
+def cmd_migrate(args) -> None:
+    provider = _load_active_letta_provider()
+    if not provider:
+        return
+
+    sources = _parse_sources(getattr(args, "sources", None))
+    target_canonical_user_id = getattr(args, "user_id", "owner:73784266")
+    db_path = getattr(args, "state_db", None) or str(get_hermes_home() / "state.db")
+    action = getattr(args, "migrate_action", None) or "audit"
+
+    if action == "audit":
+        report = provider.audit_state_db_history_migration(
+            db_path,
+            target_canonical_user_id=target_canonical_user_id,
+            include_sources=sources,
+        )
+        _print_migration_report("Letta migration audit", report, as_json=getattr(args, "json", False))
+        return
+
+    if action == "resume":
+        report = provider.migrate_state_db_history(
+            db_path,
+            target_canonical_user_id=target_canonical_user_id,
+            include_sources=sources,
+            dry_run=False,
+        )
+        _print_migration_report("Letta migration resume", report, as_json=getattr(args, "json", False))
+        return
+
+    if action == "cleanup":
+        report = provider.cleanup_migrated_history_duplicates(
+            target_canonical_user_id=target_canonical_user_id,
+        )
+        _print_migration_report("Letta migration cleanup", report, as_json=getattr(args, "json", False))
+        return
+
+    print(f"\n  Unknown memory migrate action: {action}\n")
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -447,5 +521,7 @@ def memory_command(args) -> None:
         cmd_setup(args)
     elif sub == "status":
         cmd_status(args)
+    elif sub == "migrate":
+        cmd_migrate(args)
     else:
         cmd_status(args)

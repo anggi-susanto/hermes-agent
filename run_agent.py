@@ -2178,6 +2178,9 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        skip_context_files=self.skip_context_files,
+                        skip_memory=self.skip_memory,
+                        persist_session=False,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
@@ -2231,6 +2234,17 @@ class AIAgent:
             except Exception as e:
                 logger.debug("Background memory/skill review failed: %s", e)
             finally:
+                # Ephemeral review agents own their own memory/context-provider
+                # threads; shut them down explicitly before generic close() so
+                # xdist workers don't exit while provider writer threads are
+                # still alive.
+                if review_agent is not None:
+                    try:
+                        review_agent.shutdown_memory_provider(
+                            getattr(review_agent, "_session_messages", []) or []
+                        )
+                    except Exception:
+                        pass
                 # Close all resources (httpx client, subprocesses, etc.) so
                 # GC doesn't try to clean them up on a dead asyncio event
                 # loop (which produces "Event loop is closed" errors).

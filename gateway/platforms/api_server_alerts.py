@@ -14,6 +14,15 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+try:
+    from aiohttp import web
+    API_SERVER_ADAPTER_KEY = web.AppKey("api_server_adapter", object)
+    GATEWAY_RUNNER_KEY = web.AppKey("gateway_runner", object)
+except ImportError:  # pragma: no cover - aiohttp is an optional dependency
+    web = None  # type: ignore[assignment]
+    API_SERVER_ADAPTER_KEY = "api_server_adapter"
+    GATEWAY_RUNNER_KEY = "gateway_runner"
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,8 +76,6 @@ async def handle_alert_dispatch(request, adapter) -> Any:
         "message_ids": {...}
     }
     """
-    from aiohttp import web
-    
     # Read raw body for signature verification
     try:
         body_bytes = await request.read()
@@ -118,7 +125,7 @@ async def handle_alert_dispatch(request, adapter) -> Any:
     from gateway.config import Platform
     
     # Get gateway config and adapters from the app
-    gateway_runner = request.app.get('gateway_runner')
+    gateway_runner = request.app.get(GATEWAY_RUNNER_KEY)
     if not gateway_runner:
         logger.error("Alert dispatch failed: gateway_runner not available")
         return web.json_response(
@@ -194,3 +201,12 @@ async def handle_alert_dispatch(request, adapter) -> Any:
     logger.info("Alert dispatched to %d targets: %s", len(dispatched_to), dispatched_to)
     
     return web.json_response(response_data)
+
+
+def build_alert_dispatch_handler(adapter):
+    """Return an aiohttp-compatible async handler bound to one adapter instance."""
+
+    async def _handler(request):
+        return await handle_alert_dispatch(request, adapter)
+
+    return _handler

@@ -25,6 +25,11 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     (fake_home / "cron").mkdir()
     (fake_home / "memories").mkdir()
     (fake_home / "skills").mkdir()
+    # Isolate HOME too so tests never read host-level CLI auth stores like
+    # ~/.codex/auth.json or platform allowlists from the operator environment.
+    # HERMES_HOME covers Hermes state; HOME prevents side-channel credential
+    # discovery paths from making full-suite behavior differ from targeted runs.
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
     # Reset plugin singleton so tests don't leak plugins from ~/.hermes/plugins/
     try:
@@ -37,9 +42,25 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
-    # Avoid making real calls during tests if this key is set in the env files
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    # Keep API server auth/config isolated per test. Some tests intentionally
+    # set these vars, but leaked values from earlier tests make default-config
+    # assertions flaky under the full suite.
+    monkeypatch.delenv("API_SERVER_ENABLED", raising=False)
+    monkeypatch.delenv("API_SERVER_HOST", raising=False)
+    monkeypatch.delenv("API_SERVER_PORT", raising=False)
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("API_SERVER_CORS_ORIGINS", raising=False)
+    monkeypatch.delenv("API_SERVER_MODEL_NAME", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
 
 @pytest.fixture()

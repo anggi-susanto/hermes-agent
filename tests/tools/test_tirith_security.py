@@ -1002,5 +1002,6 @@ class TestHermesHomeIsolation:
         with patch.dict(os.environ, {}, clear=True):
             # Remove HERMES_HOME entirely
             os.environ.pop("HERMES_HOME", None)
+            expected = os.path.join(os.path.expanduser("~"), ".hermes")
             result = _get_hermes_home()
-        assert result == os.path.join(os.path.expanduser("~"), ".hermes")
+        assert result == expected

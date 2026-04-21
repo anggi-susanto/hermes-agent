@@ -2,7 +2,8 @@
 
 import asyncio
 import os
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
@@ -34,13 +35,34 @@ from hermes_state import SessionDB
 @pytest.fixture()
 def mock_manager():
     """SessionManager with a mock agent factory."""
-    return SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    yield manager
+    manager.cleanup()
 
 
 @pytest.fixture()
 def agent(mock_manager):
     """HermesACPAgent backed by a mock session manager."""
     return HermesACPAgent(session_manager=mock_manager)
+
+
+def _patch_mcp_registration_imports(*, register_side_effect=None, register_return_value=None, tool_definitions=None):
+    mcp_module = ModuleType("tools.mcp_tool")
+    mcp_module.register_mcp_servers = MagicMock(
+        side_effect=register_side_effect,
+        return_value=register_return_value,
+    )
+
+    model_tools_module = ModuleType("model_tools")
+    model_tools_module.get_tool_definitions = MagicMock(return_value=tool_definitions)
+
+    return patch.dict(
+        sys.modules,
+        {
+            "tools.mcp_tool": mcp_module,
+            "model_tools": model_tools_module,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -718,8 +740,10 @@ class TestRegisterSessionMcpServers:
             registered_config.update(config_map)
             return ["mcp_test_server_tool1"]
 
-        with patch("tools.mcp_tool.register_mcp_servers", side_effect=capture_register), \
-             patch("model_tools.get_tool_definitions", return_value=[]):
+        with _patch_mcp_registration_imports(
+            register_side_effect=capture_register,
+            tool_definitions=[],
+        ):
             await agent._register_session_mcp_servers(state, [server])
 
         assert "test-server" in registered_config
@@ -750,8 +774,10 @@ class TestRegisterSessionMcpServers:
             registered_config.update(config_map)
             return []
 
-        with patch("tools.mcp_tool.register_mcp_servers", side_effect=capture_register), \
-             patch("model_tools.get_tool_definitions", return_value=[]):
+        with _patch_mcp_registration_imports(
+            register_side_effect=capture_register,
+            tool_definitions=[],
+        ):
             await agent._register_session_mcp_servers(state, [server])
 
         assert "http-server" in registered_config
@@ -783,8 +809,10 @@ class TestRegisterSessionMcpServers:
             {"function": {"name": "terminal"}},
         ]
 
-        with patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp_srv_search"]), \
-             patch("model_tools.get_tool_definitions", return_value=fake_tools):
+        with _patch_mcp_registration_imports(
+            register_return_value=["mcp_srv_search"],
+            tool_definitions=fake_tools,
+        ):
             await agent._register_session_mcp_servers(state, [server])
 
         assert state.agent.tools == fake_tools
@@ -805,7 +833,10 @@ class TestRegisterSessionMcpServers:
             env=[],
         )
 
-        with patch("tools.mcp_tool.register_mcp_servers", side_effect=RuntimeError("boom")):
+        with _patch_mcp_registration_imports(
+            register_side_effect=RuntimeError("boom"),
+            tool_definitions=None,
+        ):
             # Should not raise
             await agent._register_session_mcp_servers(state, [server])
 

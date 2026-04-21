@@ -19,6 +19,17 @@ def _make_response(outcome):
     return RequestPermissionResponse(outcome=outcome)
 
 
+def _threadsafe_result(result):
+    future = MagicMock(spec=Future)
+    future.result.return_value = result
+
+    def _runner(coro, loop):
+        coro.close()
+        return future
+
+    return _runner
+
+
 def _setup_callback(outcome, timeout=60.0):
     """
     Create a callback wired to a mock request_permission coroutine
@@ -32,12 +43,10 @@ def _setup_callback(outcome, timeout=60.0):
 
     response = _make_response(outcome)
 
-    # Patch asyncio.run_coroutine_threadsafe so it returns a future
-    # that immediately yields the response.
-    future = MagicMock(spec=Future)
-    future.result.return_value = response
-
-    with patch("acp_adapter.permissions.asyncio.run_coroutine_threadsafe", return_value=future):
+    with patch(
+        "acp_adapter.permissions.asyncio.run_coroutine_threadsafe",
+        side_effect=_threadsafe_result(response),
+    ):
         cb = make_approval_callback(mock_rp, loop, session_id="s1", timeout=timeout)
         result = cb("rm -rf /", "dangerous command")
 
@@ -68,7 +77,11 @@ class TestApprovalMapping:
         future = MagicMock(spec=Future)
         future.result.side_effect = TimeoutError("timed out")
 
-        with patch("acp_adapter.permissions.asyncio.run_coroutine_threadsafe", return_value=future):
+        def _runner(coro, loop):
+            coro.close()
+            return future
+
+        with patch("acp_adapter.permissions.asyncio.run_coroutine_threadsafe", side_effect=_runner):
             cb = make_approval_callback(mock_rp, loop, session_id="s1", timeout=0.01)
             result = cb("rm -rf /", "dangerous")
 

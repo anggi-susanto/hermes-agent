@@ -229,9 +229,10 @@ def _try_resolve_from_custom_pool(
     base_url: str,
     provider_label: str,
     api_mode_override: Optional[str] = None,
+    pool_key_override: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
-    pool_key = get_custom_provider_pool_key(base_url)
+    pool_key = (pool_key_override or "").strip() or get_custom_provider_pool_key(base_url)
     if not pool_key:
         return None
     try:
@@ -275,45 +276,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             return None
 
     config = load_config()
-    
-    # First check providers: dict (new-style user-defined providers)
-    providers = config.get("providers")
-    if isinstance(providers, dict):
-        for ep_name, entry in providers.items():
-            if not isinstance(entry, dict):
-                continue
-            # Match exact name or normalized name
-            name_norm = _normalize_custom_provider_name(ep_name)
-            # Resolve the API key from the env var name stored in key_env
-            key_env = str(entry.get("key_env", "") or "").strip()
-            resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
 
-            if requested_norm in {ep_name, name_norm, f"custom:{name_norm}"}:
-                # Found match by provider key
-                base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
-                if base_url:
-                    return {
-                        "name": entry.get("name", ep_name),
-                        "base_url": base_url.strip(),
-                        "api_key": resolved_api_key,
-                        "model": entry.get("default_model", ""),
-                    }
-            # Also check the 'name' field if present
-            display_name = entry.get("name", "")
-            if display_name:
-                display_norm = _normalize_custom_provider_name(display_name)
-                if requested_norm in {display_name, display_norm, f"custom:{display_norm}"}:
-                    # Found match by display name
-                    base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
-                    if base_url:
-                        return {
-                            "name": display_name,
-                            "base_url": base_url.strip(),
-                            "api_key": resolved_api_key,
-                            "model": entry.get("default_model", ""),
-                        }
-
-    # Fall back to custom_providers: list (legacy format)
+    # Prefer the normalized compatibility layer so v11 custom_providers and
+    # v12+ providers dict entries share the same matching and metadata shape.
     custom_providers = config.get("custom_providers")
     if isinstance(custom_providers, dict):
         logger.warning(
@@ -379,8 +344,26 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
-    # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
+    # Check if a credential pool exists for this saved custom provider.
+    # Prefer the already-resolved provider identity over re-reading config by
+    # base_url so tests/migrations that patch runtime config still hit the same
+    # pool key as the selected custom provider entry.
+    custom_pool_identity = str(
+        custom_provider.get("provider_key")
+        or custom_provider.get("name")
+        or ""
+    ).strip()
+    pool_key_override = (
+        f"custom:{_normalize_custom_provider_name(custom_pool_identity)}"
+        if custom_pool_identity
+        else None
+    )
+    pool_result = _try_resolve_from_custom_pool(
+        base_url,
+        "custom",
+        custom_provider.get("api_mode"),
+        pool_key_override=pool_key_override,
+    )
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.

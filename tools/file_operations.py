@@ -40,43 +40,60 @@ from tools.binary_extensions import BINARY_EXTENSIONS
 # Write-path deny list — blocks writes to sensitive system/credential files
 # ---------------------------------------------------------------------------
 
-_HOME = str(Path.home())
+def _build_write_denied_paths(home: Optional[str] = None) -> set[str]:
+    """Build the resolved set of fully blocked sensitive file paths.
 
-WRITE_DENIED_PATHS = {
-    os.path.realpath(p) for p in [
-        os.path.join(_HOME, ".ssh", "authorized_keys"),
-        os.path.join(_HOME, ".ssh", "id_rsa"),
-        os.path.join(_HOME, ".ssh", "id_ed25519"),
-        os.path.join(_HOME, ".ssh", "config"),
-        str(get_hermes_home() / ".env"),
-        os.path.join(_HOME, ".bashrc"),
-        os.path.join(_HOME, ".zshrc"),
-        os.path.join(_HOME, ".profile"),
-        os.path.join(_HOME, ".bash_profile"),
-        os.path.join(_HOME, ".zprofile"),
-        os.path.join(_HOME, ".netrc"),
-        os.path.join(_HOME, ".pgpass"),
-        os.path.join(_HOME, ".npmrc"),
-        os.path.join(_HOME, ".pypirc"),
-        "/etc/sudoers",
-        "/etc/passwd",
-        "/etc/shadow",
-    ]
-}
+    HOME can change during tests via monkeypatch, so this must be computed from
+    the live home directory instead of a module-import-time constant.
+    """
+    home = str(home or Path.home())
+    return {
+        os.path.realpath(p) for p in [
+            os.path.join(home, ".ssh", "authorized_keys"),
+            os.path.join(home, ".ssh", "id_rsa"),
+            os.path.join(home, ".ssh", "id_ed25519"),
+            os.path.join(home, ".ssh", "config"),
+            os.path.join(home, ".hermes", ".env"),
+            str(get_hermes_home() / ".env"),
+            os.path.join(home, ".bashrc"),
+            os.path.join(home, ".zshrc"),
+            os.path.join(home, ".profile"),
+            os.path.join(home, ".bash_profile"),
+            os.path.join(home, ".zprofile"),
+            os.path.join(home, ".netrc"),
+            os.path.join(home, ".pgpass"),
+            os.path.join(home, ".npmrc"),
+            os.path.join(home, ".pypirc"),
+            "/etc/sudoers",
+            "/etc/passwd",
+            "/etc/shadow",
+        ]
+    }
 
-WRITE_DENIED_PREFIXES = [
-    os.path.realpath(p) + os.sep for p in [
-        os.path.join(_HOME, ".ssh"),
-        os.path.join(_HOME, ".aws"),
-        os.path.join(_HOME, ".gnupg"),
-        os.path.join(_HOME, ".kube"),
-        "/etc/sudoers.d",
-        "/etc/systemd",
-        os.path.join(_HOME, ".docker"),
-        os.path.join(_HOME, ".azure"),
-        os.path.join(_HOME, ".config", "gh"),
+
+
+def _build_write_denied_prefixes(home: Optional[str] = None) -> list[str]:
+    """Build the resolved list of fully blocked sensitive directory prefixes."""
+    home = str(home or Path.home())
+    return [
+        os.path.realpath(p) + os.sep for p in [
+            os.path.join(home, ".ssh"),
+            os.path.join(home, ".aws"),
+            os.path.join(home, ".gnupg"),
+            os.path.join(home, ".kube"),
+            "/etc/sudoers.d",
+            "/etc/systemd",
+            os.path.join(home, ".docker"),
+            os.path.join(home, ".azure"),
+            os.path.join(home, ".config", "gh"),
+        ]
     ]
-]
+
+
+# Keep module-level snapshots for callers/tests that import these names directly,
+# but do not rely on them for enforcement because HOME/HERMES_HOME can change.
+WRITE_DENIED_PATHS = _build_write_denied_paths()
+WRITE_DENIED_PREFIXES = _build_write_denied_prefixes()
 
 
 def _get_safe_write_root() -> Optional[str]:
@@ -100,10 +117,12 @@ def _is_write_denied(path: str) -> bool:
     """Return True if path is on the write deny list."""
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
-    # 1) Static deny list
-    if resolved in WRITE_DENIED_PATHS:
+    # 1) Static deny list (computed from the live HOME/HERMES_HOME)
+    denied_paths = _build_write_denied_paths()
+    denied_prefixes = _build_write_denied_prefixes()
+    if resolved in denied_paths:
         return True
-    for prefix in WRITE_DENIED_PREFIXES:
+    for prefix in denied_prefixes:
         if resolved.startswith(prefix):
             return True
 

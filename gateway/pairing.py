@@ -43,7 +43,17 @@ LOCKOUT_SECONDS = 3600              # Lockout duration after too many failures
 MAX_PENDING_PER_PLATFORM = 3        # Max pending codes per platform
 MAX_FAILED_ATTEMPTS = 5             # Failed approvals before lockout
 
-PAIRING_DIR = get_hermes_dir("platforms/pairing", "pairing")
+def _pairing_dir() -> Path:
+    """Return the pairing storage directory for the current HERMES_HOME."""
+    override = globals().get("PAIRING_DIR")
+    if isinstance(override, Path):
+        return override
+    if isinstance(override, str) and override:
+        return Path(override)
+    return get_hermes_dir("platforms/pairing", "pairing")
+
+
+PAIRING_DIR: Path | None = None
 
 
 def _secure_write(path: Path, data: str) -> None:
@@ -83,19 +93,20 @@ class PairingStore:
     """
 
     def __init__(self):
-        PAIRING_DIR.mkdir(parents=True, exist_ok=True)
+        self._dir = _pairing_dir()
+        self._dir.mkdir(parents=True, exist_ok=True)
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.
         self._lock = threading.RLock()
 
     def _pending_path(self, platform: str) -> Path:
-        return PAIRING_DIR / f"{platform}-pending.json"
+        return self._dir / f"{platform}-pending.json"
 
     def _approved_path(self, platform: str) -> Path:
-        return PAIRING_DIR / f"{platform}-approved.json"
+        return self._dir / f"{platform}-approved.json"
 
     def _rate_limit_path(self) -> Path:
-        return PAIRING_DIR / "_rate_limits.json"
+        return self._dir / "_rate_limits.json"
 
     def _load_json(self, path: Path) -> dict:
         if path.exists():

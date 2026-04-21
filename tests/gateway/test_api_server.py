@@ -31,7 +31,12 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
-from gateway.platforms.api_server_alerts import verify_alert_signature
+from gateway.platforms.api_server_alerts import (
+    API_SERVER_ADAPTER_KEY,
+    GATEWAY_RUNNER_KEY,
+    build_alert_dispatch_handler,
+    verify_alert_signature,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +228,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
-    app["api_server_adapter"] = adapter
-    app["gateway_runner"] = getattr(adapter, "gateway_runner", None)
+    app[API_SERVER_ADAPTER_KEY] = adapter
+    app[GATEWAY_RUNNER_KEY] = getattr(adapter, "gateway_runner", None)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
@@ -232,8 +237,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
-    from gateway.platforms.api_server_alerts import handle_alert_dispatch
-    app.router.add_post("/api/alerts", lambda request: handle_alert_dispatch(request, adapter))
+    app.router.add_post("/api/alerts", build_alert_dispatch_handler(adapter))
     return app
 
 
@@ -1950,7 +1954,7 @@ class TestAlertsEndpoint:
     async def test_alerts_endpoint_no_gateway_runner(self, adapter):
         """POST /api/alerts returns 500 when gateway_runner is not available."""
         app = _create_app(adapter)
-        app["gateway_runner"] = None  # Simulate missing gateway_runner
+        app[GATEWAY_RUNNER_KEY] = None  # Simulate missing gateway_runner
         async with TestClient(TestServer(app)) as cli:
             with patch.dict("os.environ", {"HERMES_ALERT_SECRET": ""}):
                 resp = await cli.post(

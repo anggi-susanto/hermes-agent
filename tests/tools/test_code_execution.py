@@ -380,7 +380,7 @@ class TestStubSchemaDrift(unittest.TestCase):
     # Parameters that are internal (injected by the handler, not user-facing)
     _INTERNAL_PARAMS = {"task_id", "user_task"}
     # Parameters intentionally blocked in the sandbox
-    _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify_on_complete"}
+    _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
     def test_stubs_cover_all_schema_params(self):
         """Every user-facing parameter in the real schema must appear in the
@@ -461,6 +461,12 @@ class TestStubSchemaDrift(unittest.TestCase):
 
         # patch must accept mode and patch params
         self.assertIn("mode", src)
+
+    def test_terminal_stub_omits_blocked_params(self):
+        """Sandbox terminal stub should not expose background-only params."""
+        src = generate_hermes_tools_module(["terminal"])
+        self.assertNotIn("notify_on_complete", src)
+        self.assertNotIn("watch_patterns", src)
 
 
 # ---------------------------------------------------------------------------

@@ -33,7 +33,7 @@ class TestHermesTokenStorage:
         import asyncio
 
         # Initially empty
-        assert asyncio.run(storage.get_tokens()) is None
+        assert asyncio.get_event_loop().run_until_complete(storage.get_tokens()) is None
 
         # Save and retrieve
         mock_token = MagicMock()
@@ -42,7 +42,7 @@ class TestHermesTokenStorage:
             "token_type": "Bearer",
             "refresh_token": "ref456",
         }
-        asyncio.run(storage.set_tokens(mock_token))
+        asyncio.get_event_loop().run_until_complete(storage.set_tokens(mock_token))
 
         # File exists with correct permissions
         token_path = tmp_path / "mcp-tokens" / "test-server.json"
@@ -55,14 +55,14 @@ class TestHermesTokenStorage:
         storage = HermesTokenStorage("test-server")
         import asyncio
 
-        assert asyncio.run(storage.get_client_info()) is None
+        assert asyncio.get_event_loop().run_until_complete(storage.get_client_info()) is None
 
         mock_client = MagicMock()
         mock_client.model_dump.return_value = {
             "client_id": "hermes-123",
             "client_secret": "secret",
         }
-        asyncio.run(storage.set_client_info(mock_client))
+        asyncio.get_event_loop().run_until_complete(storage.set_client_info(mock_client))
 
         client_path = tmp_path / "mcp-tokens" / "test-server.client.json"
         assert client_path.exists()
@@ -102,7 +102,7 @@ class TestHermesTokenStorage:
         (d / "bad-server.json").write_text("NOT VALID JSON{{{")
 
         import asyncio
-        assert asyncio.run(storage.get_tokens()) is None
+        assert asyncio.get_event_loop().run_until_complete(storage.get_tokens()) is None
 
     def test_corrupt_client_info_returns_none(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -113,7 +113,7 @@ class TestHermesTokenStorage:
         (d / "bad-server.client.json").write_text("GARBAGE")
 
         import asyncio
-        assert asyncio.run(storage.get_client_info()) is None
+        assert asyncio.get_event_loop().run_until_complete(storage.get_client_info()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +379,7 @@ class TestWaitForCallbackNoBlocking:
         with patch.object(mod.asyncio, "sleep", instant_sleep):
             with patch("builtins.input", side_effect=AssertionError("input() must not be called")):
                 with pytest.raises(OAuthNonInteractiveError, match="callback timed out"):
-                    asyncio.run(_wait_for_callback())
+                    asyncio.get_event_loop().run_until_complete(_wait_for_callback())
 
 
 class TestBuildOAuthAuthNonInteractive:

@@ -221,7 +221,8 @@ class HonchoMemoryProvider(MemoryProvider):
             # Gateway/user-supplied identity must win so each external user gets
             # isolated Honcho memory even when the config has a default peer_name.
             _gw_user_id = kwargs.get("user_id")
-            if _gw_user_id:
+            _platform = str(kwargs.get("platform") or "cli").strip().lower()
+            if _gw_user_id and (_platform != "cli" or not cfg.peer_name):
                 cfg.peer_name = _gw_user_id
 
             self._config = cfg

@@ -38,12 +38,14 @@ def _make_call_result(text="file contents here", is_error=False):
 
 
 def _make_mock_server(name, session=None, tools=None):
-    """Create an MCPServerTask with mock attributes for testing."""
-    from tools.mcp_tool import MCPServerTask
-    server = MCPServerTask(name)
-    server.session = session
-    server._tools = tools or []
-    return server
+    """Create a lightweight fake server object for sync/unit tests."""
+    return SimpleNamespace(
+        name=name,
+        session=session,
+        _tools=tools or [],
+        tool_timeout=120,
+        _registered_tool_names=[],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -182,11 +184,7 @@ class TestToolHandler:
     def _patch_mcp_loop(self, coro_side_effect=None):
         """Return a patch for _run_on_mcp_loop that runs the coroutine directly."""
         def fake_run(coro, timeout=30):
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(coro)
-            finally:
-                loop.close()
+            return asyncio.get_event_loop().run_until_complete(coro)
         if coro_side_effect:
             return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=coro_side_effect)
         return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)
@@ -281,7 +279,7 @@ class TestDiscoverAndRegister:
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            registered = asyncio.run(
+            registered = asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("fs", {"command": "npx", "args": []})
             )
 
@@ -308,7 +306,7 @@ class TestDiscoverAndRegister:
         mock_create = MagicMock()
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("toolsets.create_custom_toolset", mock_create):
-            asyncio.run(
+            asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("myserver", {"command": "test"})
             )
 
@@ -335,7 +333,7 @@ class TestDiscoverAndRegister:
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            asyncio.run(
+            asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("srv", {"command": "test"})
             )
 
@@ -400,7 +398,7 @@ class TestMCPServerTask:
                 await server.shutdown()
                 assert server.session is None
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
     def test_no_command_raises(self):
         """Missing 'command' in config raises ValueError."""
@@ -411,7 +409,7 @@ class TestMCPServerTask:
             with pytest.raises(ValueError, match="no 'command'"):
                 await server.start({"args": []})
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
     def test_empty_env_gets_safe_defaults(self):
         """Empty env dict gets safe default env vars (PATH, HOME, etc.)."""
@@ -442,7 +440,7 @@ class TestMCPServerTask:
 
                 await server.shutdown()
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
     def test_shutdown_signals_task_exit(self):
         """shutdown() signals the event and waits for task completion."""
@@ -469,7 +467,7 @@ class TestMCPServerTask:
                 assert server.session is None
                 assert server._task.done()
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
 
 # ---------------------------------------------------------------------------
@@ -924,7 +922,7 @@ class TestHTTPConfig:
                 with pytest.raises(ImportError, match="HTTP transport"):
                     await server._run_http(config)
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +969,7 @@ class TestReconnection:
 
             assert run_count >= 2  # At least one reconnection attempt
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
     def test_no_reconnect_on_shutdown(self):
         """If shutdown is requested, don't attempt reconnection."""
@@ -1005,7 +1003,7 @@ class TestReconnection:
             # Should not retry because shutdown was set
             assert run_count == 1
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
     def test_no_reconnect_on_initial_failure(self):
         """First connection failure reports error immediately, no retry."""
@@ -1037,7 +1035,7 @@ class TestReconnection:
             assert server._error is not None
             assert "cannot connect" in str(server._error)
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
 
 # ---------------------------------------------------------------------------
@@ -1085,7 +1083,7 @@ class TestConfigurableTimeouts:
                 server._shutdown_event.set()
                 await task
 
-        asyncio.run(_test())
+        asyncio.get_event_loop().run_until_complete(_test())
 
     def test_timeout_passed_to_handler(self):
         """The tool handler uses the server's configured timeout."""
@@ -1101,8 +1099,12 @@ class TestConfigurableTimeouts:
 
         try:
             handler = _make_tool_handler("test_srv", "my_tool", 180)
-            with patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
-                mock_run.return_value = json.dumps({"result": "ok"})
+
+            def _capture_timeout(coro, timeout=30):
+                coro.close()
+                return json.dumps({"result": "ok"})
+
+            with patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_capture_timeout) as mock_run:
                 handler({})
                 # Verify timeout=180 was passed
                 call_kwargs = mock_run.call_args
@@ -1202,11 +1204,7 @@ class TestUtilityHandlers:
     def _patch_mcp_loop(self):
         """Return a patch for _run_on_mcp_loop that runs the coroutine directly."""
         def fake_run(coro, timeout=30):
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(coro)
-            finally:
-                loop.close()
+            return asyncio.get_event_loop().run_until_complete(coro)
         return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)
 
     # -- list_resources --
@@ -1459,7 +1457,7 @@ class TestUtilityToolRegistration:
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            registered = asyncio.run(
+            registered = asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("fs", {"command": "npx", "args": []})
             )
 
@@ -1494,7 +1492,7 @@ class TestUtilityToolRegistration:
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            asyncio.run(
+            asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("myserv", {"command": "test"})
             )
 
@@ -1523,7 +1521,7 @@ class TestUtilityToolRegistration:
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            asyncio.run(
+            asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("chk", {"command": "test"})
             )
 
@@ -1880,7 +1878,7 @@ class TestSamplingCallbackText:
             return_value=fake_client.chat.completions.create.return_value,
         ):
             params = _make_sampling_params()
-            result = asyncio.run(self.handler(None, params))
+            result = asyncio.get_event_loop().run_until_complete(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResult)
         assert isinstance(result.content, TextContent)
@@ -1899,7 +1897,7 @@ class TestSamplingCallbackText:
             return_value=fake_client.chat.completions.create.return_value,
         ) as mock_call:
             params = _make_sampling_params(system_prompt="Be helpful")
-            asyncio.run(self.handler(None, params))
+            asyncio.get_event_loop().run_until_complete(self.handler(None, params))
 
         call_args = mock_call.call_args
         messages = call_args.kwargs["messages"]
@@ -1920,7 +1918,7 @@ class TestSamplingCallbackText:
             return_value=fake_client.chat.completions.create.return_value,
         ) as mock_call:
             params = _make_sampling_params(tools=[server_tool])
-            asyncio.run(self.handler(None, params))
+            asyncio.get_event_loop().run_until_complete(self.handler(None, params))
 
         tools = mock_call.call_args.kwargs["tools"]
         assert tools == [{
@@ -1944,7 +1942,7 @@ class TestSamplingCallbackText:
             return_value=fake_client.chat.completions.create.return_value,
         ):
             params = _make_sampling_params()
-            result = asyncio.run(self.handler(None, params))
+            result = asyncio.get_event_loop().run_until_complete(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResult)
         assert result.stopReason == "maxTokens"
@@ -1968,7 +1966,7 @@ class TestSamplingCallbackToolUse:
             return_value=fake_client.chat.completions.create.return_value,
         ):
             params = _make_sampling_params()
-            result = asyncio.run(self.handler(None, params))
+            result = asyncio.get_event_loop().run_until_complete(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResultWithTools)
         assert result.stopReason == "toolUse"
@@ -1994,7 +1992,7 @@ class TestSamplingCallbackToolUse:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(self.handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(self.handler(None, _make_sampling_params()))
 
         assert isinstance(result, CreateMessageResultWithTools)
         assert len(result.content) == 2
@@ -2019,12 +2017,12 @@ class TestToolLoopGovernance:
         ):
             params = _make_sampling_params()
             # Round 1, 2: allowed
-            r1 = asyncio.run(handler(None, params))
+            r1 = asyncio.get_event_loop().run_until_complete(handler(None, params))
             assert isinstance(r1, CreateMessageResultWithTools)
-            r2 = asyncio.run(handler(None, params))
+            r2 = asyncio.get_event_loop().run_until_complete(handler(None, params))
             assert isinstance(r2, CreateMessageResultWithTools)
             # Round 3: exceeds limit
-            r3 = asyncio.run(handler(None, params))
+            r3 = asyncio.get_event_loop().run_until_complete(handler(None, params))
             assert isinstance(r3, ErrorData)
             assert "Tool loop limit exceeded" in r3.message
 
@@ -2041,17 +2039,17 @@ class TestToolLoopGovernance:
             side_effect=lambda **kw: responses[0],
         ):
             # Tool response (round 1 of 1 allowed)
-            r1 = asyncio.run(handler(None, _make_sampling_params()))
+            r1 = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(r1, CreateMessageResultWithTools)
 
             # Text response resets counter
             responses[0] = _make_llm_response()
-            r2 = asyncio.run(handler(None, _make_sampling_params()))
+            r2 = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(r2, CreateMessageResult)
 
             # Tool response again (should succeed since counter was reset)
             responses[0] = _make_llm_tool_response()
-            r3 = asyncio.run(handler(None, _make_sampling_params()))
+            r3 = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(r3, CreateMessageResultWithTools)
 
     def test_max_tool_rounds_zero_disables(self):
@@ -2064,7 +2062,7 @@ class TestToolLoopGovernance:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(result, ErrorData)
             assert "Tool loops disabled" in result.message
 
@@ -2084,10 +2082,10 @@ class TestSamplingErrors:
             return_value=fake_client.chat.completions.create.return_value,
         ):
             # First call succeeds
-            r1 = asyncio.run(handler(None, _make_sampling_params()))
+            r1 = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(r1, CreateMessageResult)
             # Second call is rate limited
-            r2 = asyncio.run(handler(None, _make_sampling_params()))
+            r2 = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(r2, ErrorData)
             assert "rate limit" in r2.message.lower()
             assert handler.metrics["errors"] == 1
@@ -2105,7 +2103,7 @@ class TestSamplingErrors:
             "agent.auxiliary_client.call_llm",
             side_effect=slow_call,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(result, ErrorData)
             assert "timed out" in result.message.lower()
             assert handler.metrics["errors"] == 1
@@ -2117,7 +2115,7 @@ class TestSamplingErrors:
             "agent.auxiliary_client.call_llm",
             side_effect=RuntimeError("No LLM provider configured"),
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(result, ErrorData)
             assert handler.metrics["errors"] == 1
 
@@ -2135,7 +2133,7 @@ class TestSamplingErrors:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
 
         assert isinstance(result, ErrorData)
         assert "empty response" in result.message.lower()
@@ -2155,7 +2153,7 @@ class TestSamplingErrors:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
 
         assert isinstance(result, ErrorData)
         assert "empty response" in result.message.lower()
@@ -2174,7 +2172,7 @@ class TestSamplingErrors:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
 
         assert isinstance(result, ErrorData)
         assert "empty response" in result.message.lower()
@@ -2195,7 +2193,7 @@ class TestModelWhitelist:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(result, CreateMessageResult)
 
     def test_disallowed_model_rejected(self):
@@ -2206,7 +2204,7 @@ class TestModelWhitelist:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(result, ErrorData)
             assert "not allowed" in result.message
             assert handler.metrics["errors"] == 1
@@ -2220,7 +2218,7 @@ class TestModelWhitelist:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
             assert isinstance(result, CreateMessageResult)
 
 
@@ -2241,7 +2239,7 @@ class TestMalformedToolCallArgs:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
 
         assert isinstance(result, CreateMessageResultWithTools)
         tc = result.content[0]
@@ -2269,7 +2267,7 @@ class TestMalformedToolCallArgs:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            result = asyncio.run(handler(None, _make_sampling_params()))
+            result = asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
 
         assert isinstance(result, CreateMessageResultWithTools)
         assert result.content[0].input == {"key": "val"}
@@ -2289,7 +2287,7 @@ class TestMetricsTracking:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            asyncio.run(handler(None, _make_sampling_params()))
+            asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
 
         assert handler.metrics["requests"] == 1
         assert handler.metrics["tokens_used"] == 42
@@ -2304,7 +2302,7 @@ class TestMetricsTracking:
             "agent.auxiliary_client.call_llm",
             return_value=fake_client.chat.completions.create.return_value,
         ):
-            asyncio.run(handler(None, _make_sampling_params()))
+            asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
 
         assert handler.metrics["tool_use_count"] == 1
         assert handler.metrics["requests"] == 1
@@ -2316,7 +2314,7 @@ class TestMetricsTracking:
             "agent.auxiliary_client.call_llm",
             side_effect=RuntimeError("No LLM provider configured"),
         ):
-            asyncio.run(handler(None, _make_sampling_params()))
+            asyncio.get_event_loop().run_until_complete(handler(None, _make_sampling_params()))
 
         assert handler.metrics["errors"] == 1
         assert handler.metrics["requests"] == 0
@@ -2552,7 +2550,7 @@ class TestMCPSelectiveToolLoading:
                 return await _discover_and_register_server(name, config)
 
         try:
-            registered = asyncio.run(run())
+            registered = asyncio.get_event_loop().run_until_complete(run())
         finally:
             _servers.pop(name, None)
         return registered, mock_registry
@@ -2681,7 +2679,7 @@ class TestMCPSelectiveToolLoading:
                 return registered, _existing_tool_names()
 
         try:
-            registered, existing = asyncio.run(run())
+            registered, existing = asyncio.get_event_loop().run_until_complete(run())
             assert registered == ["mcp_ink_existing_create_service"]
             assert existing == ["mcp_ink_existing_create_service"]
         finally:
@@ -2715,7 +2713,7 @@ class TestMCPSelectiveToolLoading:
                 )
 
         try:
-            registered = asyncio.run(run())
+            registered = asyncio.get_event_loop().run_until_complete(run())
             assert registered == []
             mock_create.assert_not_called()
             assert mock_registry.get_all_tool_names() == []
@@ -2826,7 +2824,7 @@ class TestMCPBuiltinCollisionGuard:
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            registered = asyncio.run(
+            registered = asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("abc", {"command": "test", "args": []})
             )
 
@@ -2853,7 +2851,7 @@ class TestMCPBuiltinCollisionGuard:
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            registered = asyncio.run(
+            registered = asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("minimax", {"command": "test", "args": []})
             )
 
@@ -2891,7 +2889,7 @@ class TestMCPBuiltinCollisionGuard:
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
              patch("tools.registry.registry", mock_registry):
-            registered = asyncio.run(
+            registered = asyncio.get_event_loop().run_until_complete(
                 _discover_and_register_server("srv", {"command": "test", "args": []})
             )
 

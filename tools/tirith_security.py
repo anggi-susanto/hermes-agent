@@ -33,6 +33,8 @@ import tempfile
 import threading
 import time
 import urllib.request
+from pathlib import Path
+
 
 from hermes_constants import get_hermes_home
 
@@ -107,7 +109,10 @@ _MARKER_TTL = 86400  # 24 hours
 
 def _get_hermes_home() -> str:
     """Return the Hermes home directory, respecting HERMES_HOME env var."""
-    return str(get_hermes_home())
+    hermes_home = os.getenv("HERMES_HOME", "").strip()
+    if hermes_home:
+        return os.path.realpath(os.path.expanduser(hermes_home))
+    return str(Path.home() / ".hermes")
 
 
 def _failure_marker_path() -> str:

@@ -70,11 +70,7 @@ class TestProbeMcpServerTools:
 
             # Simulate running the async probe
             def run_coro(coro, timeout=120):
-                loop = asyncio.new_event_loop()
-                try:
-                    return loop.run_until_complete(coro)
-                finally:
-                    loop.close()
+                return asyncio.get_event_loop().run_until_complete(coro)
 
             mock_run.side_effect = run_coro
 
@@ -111,11 +107,7 @@ class TestProbeMcpServerTools:
              patch("tools.mcp_tool._stop_mcp_loop"):
 
             def run_coro(coro, timeout=120):
-                loop = asyncio.new_event_loop()
-                try:
-                    return loop.run_until_complete(coro)
-                finally:
-                    loop.close()
+                return asyncio.get_event_loop().run_until_complete(coro)
 
             mock_run.side_effect = run_coro
 
@@ -145,11 +137,7 @@ class TestProbeMcpServerTools:
              patch("tools.mcp_tool._stop_mcp_loop"):
 
             def run_coro(coro, timeout=120):
-                loop = asyncio.new_event_loop()
-                try:
-                    return loop.run_until_complete(coro)
-                finally:
-                    loop.close()
+                return asyncio.get_event_loop().run_until_complete(coro)
 
             mock_run.side_effect = run_coro
 
@@ -165,8 +153,14 @@ class TestProbeMcpServerTools:
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._load_mcp_config", return_value=config), \
              patch("tools.mcp_tool._ensure_mcp_loop"), \
-             patch("tools.mcp_tool._run_on_mcp_loop", side_effect=RuntimeError("boom")), \
+             patch("tools.mcp_tool._run_on_mcp_loop") as mock_run, \
              patch("tools.mcp_tool._stop_mcp_loop") as mock_stop:
+
+            def _boom(coro, timeout=120):
+                coro.close()
+                raise RuntimeError("boom")
+
+            mock_run.side_effect = _boom
 
             from tools.mcp_tool import probe_mcp_server_tools
             result = probe_mcp_server_tools()
@@ -199,11 +193,7 @@ class TestProbeMcpServerTools:
              patch("tools.mcp_tool._stop_mcp_loop"):
 
             def run_coro(coro, timeout=120):
-                loop = asyncio.new_event_loop()
-                try:
-                    return loop.run_until_complete(coro)
-                finally:
-                    loop.close()
+                return asyncio.get_event_loop().run_until_complete(coro)
 
             mock_run.side_effect = run_coro
 

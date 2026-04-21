@@ -1813,11 +1813,11 @@ def mount_spa(application: FastAPI):
 mount_spa(app)
 
 
-def start_server(host: str = "127.0.0.1", port: int = 9119, open_browser: bool = True):
+def start_server(host: str = "0.0.0.0", port: int = 9119, open_browser: bool = True):
     """Start the web UI server."""
     import uvicorn
 
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    if host not in ("0.0.0.0", "localhost", "::1"):
         import logging
         logging.warning(
             "Binding to %s — the web UI exposes config and API keys. "

@@ -848,6 +848,16 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
     endpoints where the base URL lives in config.yaml instead of the live
     environment.
     """
+    openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+    main_provider = _read_main_provider()
+    has_explicit_custom_runtime = bool(
+        openai_base
+        or main_provider == "custom"
+        or str(main_provider).startswith("custom:")
+    )
+    if not has_explicit_custom_runtime:
+        return None, None, None
+
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -857,7 +867,6 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
         runtime = None
 
     if not isinstance(runtime, dict):
-        openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
         openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not openai_base:
             return None, None, None
@@ -1758,6 +1767,26 @@ def resolve_vision_provider_client(
     if client is None:
         return requested, None, None
     return requested, client, final_model
+
+
+def get_vision_auxiliary_client(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Backward-compatible wrapper returning only (client, model) for vision tasks."""
+    _, client, resolved_model = resolve_vision_provider_client(
+        provider,
+        model,
+        base_url=base_url,
+        api_key=api_key,
+        async_mode=async_mode,
+    )
+    return client, resolved_model
+
 
 
 def get_auxiliary_extra_body() -> dict:

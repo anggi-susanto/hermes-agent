@@ -25,6 +25,8 @@ import signal
 import tempfile
 import threading
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
@@ -2615,12 +2617,11 @@ class GatewayRunner:
         # are system-generated and must skip user authorization.
         if getattr(event, "internal", False):
             pass
-        elif source.user_id is None:
-            # Messages with no user identity (Telegram service messages,
-            # channel forwards, anonymous admin actions) cannot be
+        elif source.user_id is None and source.chat_type == "dm":
+            # Messages with no user identity in a DM cannot be paired or
             # authorized — drop silently instead of triggering the pairing
             # flow with a None user_id.
-            logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+            logger.debug("Ignoring DM message with no user_id from %s", source.platform.value)
             return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)

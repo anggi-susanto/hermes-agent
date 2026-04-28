@@ -3501,12 +3501,49 @@ class GatewayRunner:
             # compression on every turn in long gateway sessions.
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.85
+            _hyg_max_tokens = 0
             _hyg_compression_enabled = True
             _hyg_config_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
             _hyg_api_key = None
             _hyg_data = {}
+
+            def _read_hygiene_float_env(name: str, default: float) -> float:
+                raw = os.getenv(name)
+                if raw is None or str(raw).strip() == "":
+                    return default
+                try:
+                    value = float(raw)
+                    return value if value > 0 else default
+                except (TypeError, ValueError):
+                    logger.warning("Invalid %s=%r; using %.2f", name, raw, default)
+                    return default
+
+            def _read_hygiene_int_env(name: str, default: int = 0) -> int:
+                raw = os.getenv(name)
+                if raw is None or str(raw).strip() == "":
+                    return default
+                try:
+                    value = int(float(raw))
+                    return value if value > 0 else default
+                except (TypeError, ValueError):
+                    logger.warning("Invalid %s=%r; using %s", name, raw, default)
+                    return default
+
+            # Operational guard for messaging platforms: a model may advertise a
+            # huge context window (e.g. 400K), but interactive gateway requests
+            # can still time out far below that.  These env knobs let the
+            # gateway compact before the provider/proxy gets dragged into a
+            # multi-minute prefill death spiral.
+            _hyg_threshold_pct = _read_hygiene_float_env(
+                "HERMES_GATEWAY_HYGIENE_THRESHOLD_PCT",
+                _hyg_threshold_pct,
+            )
+            _hyg_max_tokens = _read_hygiene_int_env(
+                "HERMES_GATEWAY_HYGIENE_MAX_TOKENS",
+                0,
+            )
             try:
                 _hyg_cfg_path = _hermes_home / "config.yaml"
                 if _hyg_cfg_path.exists():
@@ -3591,9 +3628,15 @@ class GatewayRunner:
                     config_context_length=_hyg_config_context_length,
                     provider=_hyg_provider or "",
                 )
-                _compress_token_threshold = int(
+                _context_pct_threshold = int(
                     _hyg_context_length * _hyg_threshold_pct
                 )
+                _compress_token_threshold = _context_pct_threshold
+                if _hyg_max_tokens > 0:
+                    _compress_token_threshold = min(
+                        _compress_token_threshold,
+                        _hyg_max_tokens,
+                    )
                 _warn_token_threshold = int(_hyg_context_length * 0.95)
 
                 _msg_count = len(history)
@@ -3629,13 +3672,22 @@ class GatewayRunner:
                 )
 
                 if _needs_compress:
+                    _threshold_label = (
+                        f"min({int(_hyg_threshold_pct * 100)}% of "
+                        f"{_hyg_context_length:,} = {_context_pct_threshold:,}, "
+                        f"max {_hyg_max_tokens:,})"
+                        if _hyg_max_tokens > 0
+                        else (
+                            f"{int(_hyg_threshold_pct * 100)}% of "
+                            f"{_hyg_context_length:,} = {_compress_token_threshold:,}"
+                        )
+                    )
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                        "(threshold: %s%% of %s = %s tokens)",
+                        "(threshold: %s tokens via %s)",
                         _msg_count, f"{_approx_tokens:,}", _token_source,
-                        int(_hyg_threshold_pct * 100),
-                        f"{_hyg_context_length:,}",
                         f"{_compress_token_threshold:,}",
+                        _threshold_label,
                     )
 
                     _hyg_meta = {"thread_id": source.thread_id} if source.thread_id else None

@@ -186,6 +186,34 @@ class TestSessionHygieneThresholds:
         assert approx_tokens >= low_threshold
         assert approx_tokens < high_threshold
 
+    def test_max_token_operational_guard_caps_huge_context_model_threshold(self):
+        """A 400K context model still needs an interactive gateway cap.
+
+        Regression: 250K-token Telegram sessions were under 85% of a 400K
+        advertised window, so hygiene did not fire and the provider/proxy timed
+        out. HERMES_GATEWAY_HYGIENE_MAX_TOKENS caps the threshold below the
+        model's theoretical context length.
+        """
+        context_length = 400_000
+        threshold_pct = 0.85
+        context_pct_threshold = int(context_length * threshold_pct)  # 340K
+        max_tokens = 120_000
+        effective_threshold = min(context_pct_threshold, max_tokens)
+
+        assert effective_threshold == 120_000
+        assert 250_000 >= effective_threshold
+
+    def test_max_token_guard_disabled_when_zero(self):
+        """Zero/no max-token guard keeps the original context-percentage threshold."""
+        context_length = 400_000
+        threshold_pct = 0.85
+        context_pct_threshold = int(context_length * threshold_pct)
+        max_tokens = 0
+        effective_threshold = min(context_pct_threshold, max_tokens) if max_tokens > 0 else context_pct_threshold
+
+        assert effective_threshold == 340_000
+        assert 250_000 < effective_threshold
+
     def test_minimum_message_guard(self):
         """Sessions with fewer than 4 messages should never trigger."""
         history = _make_history(3, content_size=100_000)

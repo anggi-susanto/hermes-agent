@@ -25,6 +25,8 @@ COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("anthropic/claude-opus-4.6",       "recommended"),
+    ("deepseek/deepseek-v4-pro",        ""),
+    ("deepseek/deepseek-v4-flash",      ""),
     ("anthropic/claude-sonnet-4.6",     ""),
     ("qwen/qwen3.6-plus",               ""),
     ("anthropic/claude-sonnet-4.5",     ""),
@@ -194,6 +196,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "deepseek": [
         "deepseek-chat",
         "deepseek-reasoner",
+    ],
+    "bedrock": [
+        "deepseek.v3.2",
+        "deepseek.v3-v1:0",
+        "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "amazon.nova-pro-v1:0",
+        "amazon.nova-lite-v1:0",
+        "amazon.nova-micro-v1:0",
     ],
     "xiaomi": [
         "mimo-v2-pro",
@@ -499,6 +509,7 @@ _PROVIDER_LABELS = {
     "minimax-cn": "MiniMax (China)",
     "anthropic": "Anthropic",
     "deepseek": "DeepSeek",
+    "bedrock": "AWS Bedrock",
     "opencode-zen": "OpenCode Zen",
     "opencode-go": "OpenCode Go",
     "ai-gateway": "AI Gateway",
@@ -533,6 +544,9 @@ _PROVIDER_ALIASES = {
     "claude": "anthropic",
     "claude-code": "anthropic",
     "deep-seek": "deepseek",
+    "aws": "bedrock",
+    "aws-bedrock": "bedrock",
+    "amazon-bedrock": "bedrock",
     "opencode": "opencode-zen",
     "zen": "opencode-zen",
     "go": "opencode-go",

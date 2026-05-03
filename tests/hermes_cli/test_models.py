@@ -7,6 +7,7 @@ from hermes_cli.models import (
     filter_nous_free_models, _NOUS_ALLOWED_FREE_MODELS,
     is_nous_free_tier, partition_nous_models_by_tier,
     check_nous_free_tier, _FREE_TIER_CACHE_TTL,
+    curated_models_for_provider, get_default_model_for_provider, provider_model_ids,
 )
 import hermes_cli.models as _models_mod
 
@@ -78,6 +79,28 @@ class TestOpenRouterModels:
     def test_at_least_5_models(self):
         """Sanity check that the models list hasn't been accidentally truncated."""
         assert len(OPENROUTER_MODELS) >= 5
+
+    def test_deepseek_v4_choices_present(self):
+        """DeepSeek V4 OpenRouter models should be visible in the static picker."""
+        ids = [mid for mid, _ in OPENROUTER_MODELS]
+        assert "deepseek/deepseek-v4-pro" in ids
+        assert "deepseek/deepseek-v4-flash" in ids
+
+
+class TestBedrockModels:
+    def test_bedrock_provider_catalog_contains_available_deepseek_models(self):
+        ids = provider_model_ids("bedrock")
+        assert ids[0] == "deepseek.v3.2"
+        assert "deepseek.v3-v1:0" in ids
+
+    def test_bedrock_default_model_is_deepseek_v32(self):
+        assert get_default_model_for_provider("bedrock") == "deepseek.v3.2"
+
+    def test_bedrock_curated_models_visible(self):
+        assert curated_models_for_provider("bedrock")[:2] == [
+            ("deepseek.v3.2", ""),
+            ("deepseek.v3-v1:0", ""),
+        ]
 
 
 class TestFetchOpenRouterModels:

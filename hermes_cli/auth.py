@@ -136,6 +136,19 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "bedrock": ProviderConfig(
+        id="bedrock",
+        name="AWS Bedrock",
+        auth_type="aws",
+        inference_base_url="bedrock://",
+        api_key_env_vars=(
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_PROFILE",
+        ),
+        base_url_env_var="AWS_REGION",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",

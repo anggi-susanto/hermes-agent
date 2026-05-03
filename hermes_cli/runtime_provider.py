@@ -124,8 +124,7 @@ def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
         return "chat_completions"
 
 
-_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages"}
-
+_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_invoke"}
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
     """Validate an api_mode value from config. Returns None if invalid."""
@@ -134,6 +133,55 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
         if normalized in _VALID_API_MODES:
             return normalized
     return None
+
+
+def _bedrock_region(model_cfg: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve the AWS region used by the native Bedrock runtime."""
+    model_cfg = model_cfg or {}
+    cfg_region = str(
+        model_cfg.get("region")
+        or model_cfg.get("aws_region")
+        or model_cfg.get("bedrock_region")
+        or ""
+    ).strip()
+    return (
+        cfg_region
+        or os.getenv("AWS_REGION", "").strip()
+        or os.getenv("AWS_DEFAULT_REGION", "").strip()
+        or "us-east-1"
+    )
+
+
+def _resolve_bedrock_runtime(
+    *,
+    requested_provider: str,
+    model_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve native AWS Bedrock runtime settings.
+
+    Bedrock auth is handled by boto3's standard credential chain (env vars,
+    AWS_PROFILE, shared config files, or IAM role). The api_key field is a
+    non-secret sentinel so existing CLI checks know credentials are delegated
+    to AWS instead of OpenAI-style bearer auth.
+    """
+    model_cfg = model_cfg or _get_model_config()
+    region = _bedrock_region(model_cfg)
+    model_name = str(
+        model_cfg.get("default")
+        or model_cfg.get("model")
+        or os.getenv("BEDROCK_MODEL_ID", "")
+        or ""
+    ).strip()
+    return {
+        "provider": "bedrock",
+        "api_mode": "bedrock_invoke",
+        "base_url": f"bedrock://{region}",
+        "api_key": "aws-env",
+        "source": "aws-sdk",
+        "requested_provider": requested_provider,
+        "region": region,
+        "model": model_name,
+    }
 
 
 def _resolve_runtime_from_pool_entry(
@@ -789,6 +837,12 @@ def resolve_runtime_provider(
             "source": creds.get("source", "process"),
             "requested_provider": requested_provider,
         }
+
+    if provider == "bedrock":
+        return _resolve_bedrock_runtime(
+            requested_provider=requested_provider,
+            model_cfg=model_cfg,
+        )
 
     # Anthropic (native Messages API)
     if provider == "anthropic":

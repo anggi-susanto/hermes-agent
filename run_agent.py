@@ -676,8 +676,10 @@ class AIAgent:
         self.provider = provider_name or ""
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
-        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
+        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_invoke"}:
             self.api_mode = api_mode
+        elif self.provider == "bedrock":
+            self.api_mode = "bedrock_invoke"
         elif self.provider == "openai-codex":
             self.api_mode = "codex_responses"
         elif (provider_name is None) and "chatgpt.com/backend-api/codex" in self._base_url_lower:
@@ -885,6 +887,15 @@ class AIAgent:
                 print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
                 if effective_key and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+        elif self.api_mode == "bedrock_invoke":
+            self.api_key = api_key or "aws-env"
+            self.client = None
+            self._client_kwargs = {}
+            self._bedrock_client = None
+            self._bedrock_region = self._bedrock_region_from_base_url(base_url)
+            if not self.quiet_mode:
+                print(f"🤖 AI Agent initialized with model: {self.model} (AWS Bedrock)")
+                print(f"🌏 Bedrock region: {self._bedrock_region}")
         else:
             if api_key and base_url:
                 # Explicit credentials from CLI/gateway — construct directly.
@@ -4780,6 +4791,8 @@ class AIAgent:
                     )
                 elif self.api_mode == "anthropic_messages":
                     result["response"] = self._anthropic_messages_create(api_kwargs)
+                elif self.api_mode == "bedrock_invoke":
+                    result["response"] = self._bedrock_invoke_model_create(api_kwargs)
                 else:
                     request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
                     result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
@@ -5008,6 +5021,9 @@ class AIAgent:
         Falls back to _interruptible_api_call on provider errors indicating
         streaming is not supported.
         """
+        if self.api_mode == "bedrock_invoke":
+            return self._bedrock_invoke_model_stream_create(api_kwargs)
+
         if self.api_mode == "codex_responses":
             # Codex streams internally via _run_codex_stream. The main dispatch
             # in _interruptible_api_call already calls it; we just need to
@@ -6077,8 +6093,613 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
+    def _bedrock_region_from_base_url(self, base_url: str | None) -> str:
+        """Extract region from bedrock://<region>, falling back to AWS env."""
+        raw = (base_url or "").strip()
+        if raw.lower().startswith("bedrock://"):
+            region = raw.split("://", 1)[1].strip().strip("/")
+            if region:
+                return region
+        return (
+            os.getenv("AWS_REGION", "").strip()
+            or os.getenv("AWS_DEFAULT_REGION", "").strip()
+            or "us-east-1"
+        )
+
+    def _bedrock_model_family(self, model: str | None = None) -> str:
+        """Return the Phase 2 Bedrock adapter family for the model id."""
+        model_id = (model or getattr(self, "model", "") or "").lower()
+        if "anthropic.claude" in model_id or model_id.startswith("anthropic."):
+            return "claude"
+        if model_id.startswith("amazon.nova") or ".nova-" in model_id:
+            return "nova"
+        return "deepseek"
+
+    def _bedrock_message_text(self, content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    if isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+                    elif isinstance(part.get("content"), str):
+                        parts.append(part["content"])
+                elif part is not None:
+                    parts.append(str(part))
+            return "\n".join(p for p in parts if p)
+        return str(content) if content is not None else ""
+
+    def _bedrock_prepare_messages(self, messages: list) -> list:
+        """Convert Hermes/OpenAI-style messages to simple role/text dicts."""
+        prepared = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role not in {"system", "user", "assistant"}:
+                continue
+            text = self._bedrock_message_text(msg.get("content", ""))
+            if text:
+                prepared.append({"role": role, "content": text})
+        return prepared
+
+    def _bedrock_max_tokens(self, api_kwargs: dict):
+        max_tokens = api_kwargs.get("max_tokens") or getattr(self, "max_tokens", None)
+        if max_tokens is None:
+            max_tokens = int(os.getenv("BEDROCK_MAX_TOKENS", "4096"))
+        return max_tokens
+
+    def _bedrock_build_claude_body(self, api_kwargs: dict) -> dict:
+        messages = []
+        system_parts = []
+        for msg in self._bedrock_prepare_messages(api_kwargs.get("messages", [])):
+            role = msg["role"]
+            text = msg["content"]
+            if role == "system":
+                system_parts.append(text)
+                continue
+            messages.append({
+                "role": role,
+                "content": [{"type": "text", "text": text}],
+            })
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": messages,
+            "max_tokens": self._bedrock_max_tokens(api_kwargs),
+        }
+        if system_parts:
+            body["system"] = "\n\n".join(system_parts)
+        for key in ("temperature", "top_p", "stop_sequences"):
+            if key in api_kwargs and api_kwargs[key] is not None:
+                body[key] = api_kwargs[key]
+        if "stop" in api_kwargs and api_kwargs["stop"] is not None:
+            body["stop_sequences"] = api_kwargs["stop"]
+        return body
+
+    def _bedrock_build_nova_body(self, api_kwargs: dict) -> dict:
+        messages = []
+        system_parts = []
+        for msg in self._bedrock_prepare_messages(api_kwargs.get("messages", [])):
+            role = msg["role"]
+            text = msg["content"]
+            if role == "system":
+                system_parts.append({"text": text})
+                continue
+            messages.append({"role": role, "content": [{"text": text}]})
+        body = {"messages": messages}
+        if system_parts:
+            body["system"] = system_parts
+        inference_config = {"maxTokens": self._bedrock_max_tokens(api_kwargs)}
+        if api_kwargs.get("temperature") is not None:
+            inference_config["temperature"] = api_kwargs["temperature"]
+        if api_kwargs.get("top_p") is not None:
+            inference_config["topP"] = api_kwargs["top_p"]
+        if api_kwargs.get("stop") is not None:
+            inference_config["stopSequences"] = api_kwargs["stop"]
+        if api_kwargs.get("stop_sequences") is not None:
+            inference_config["stopSequences"] = api_kwargs["stop_sequences"]
+        body["inferenceConfig"] = inference_config
+        return body
+
+    def _bedrock_build_deepseek_body(self, api_kwargs: dict) -> dict:
+        body = {"messages": self._bedrock_prepare_messages(api_kwargs.get("messages", []))}
+        body["max_tokens"] = self._bedrock_max_tokens(api_kwargs)
+        for key in ("temperature", "top_p", "stop", "stop_sequences"):
+            if key in api_kwargs and api_kwargs[key] is not None:
+                body[key] = api_kwargs[key]
+        return body
+
+    def _bedrock_build_invoke_body(self, api_kwargs: dict) -> dict:
+        """Build the JSON body for Bedrock invoke_model chat calls."""
+        family = self._bedrock_model_family(api_kwargs.get("model"))
+        if family == "claude":
+            return self._bedrock_build_claude_body(api_kwargs)
+        if family == "nova":
+            return self._bedrock_build_nova_body(api_kwargs)
+        return self._bedrock_build_deepseek_body(api_kwargs)
+
+    @staticmethod
+    def _bedrock_tool_call_attr(tool_call, key: str, default=None):
+        if isinstance(tool_call, dict):
+            return tool_call.get(key, default)
+        return getattr(tool_call, key, default)
+
+    @staticmethod
+    def _bedrock_tool_function(tool_call):
+        if isinstance(tool_call, dict):
+            return tool_call.get("function", {}) or {}
+        return getattr(tool_call, "function", None)
+
+    def _bedrock_converse_tool_config(self, tools: list | None) -> dict | None:
+        """Convert OpenAI chat-completions tools to Bedrock Converse toolConfig."""
+        converted = []
+        for tool in tools or []:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function", {}) if tool.get("type") == "function" else tool.get("function", {})
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            params = fn.get("parameters")
+            if not isinstance(params, dict):
+                params = {"type": "object", "properties": {}}
+            description = fn.get("description")
+            if description is None:
+                description = ""
+            converted.append({
+                "toolSpec": {
+                    "name": name.strip(),
+                    "description": str(description),
+                    "inputSchema": {"json": params},
+                }
+            })
+        return {"tools": converted} if converted else None
+
+    def _bedrock_converse_inference_config(self, api_kwargs: dict) -> dict:
+        config = {"maxTokens": self._bedrock_max_tokens(api_kwargs)}
+        if api_kwargs.get("temperature") is not None:
+            config["temperature"] = api_kwargs["temperature"]
+        if api_kwargs.get("top_p") is not None:
+            config["topP"] = api_kwargs["top_p"]
+        stop = api_kwargs.get("stop_sequences") if api_kwargs.get("stop_sequences") is not None else api_kwargs.get("stop")
+        if stop is not None:
+            config["stopSequences"] = stop
+        return config
+
+    def _bedrock_parse_tool_arguments(self, raw_args) -> dict:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if raw_args is None:
+            return {}
+        if not isinstance(raw_args, str):
+            raw_args = str(raw_args)
+        raw_args = raw_args.strip()
+        if not raw_args:
+            return {}
+        try:
+            parsed = json.loads(raw_args)
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+        except Exception:
+            return {"_raw": raw_args}
+
+    def _bedrock_converse_content_from_message(self, msg: dict) -> tuple[str | None, list]:
+        role = msg.get("role")
+        content = []
+        text = self._bedrock_message_text(msg.get("content", ""))
+        if text:
+            content.append({"text": text})
+
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                fn = self._bedrock_tool_function(tc)
+                if isinstance(fn, dict):
+                    name = fn.get("name")
+                    arguments = fn.get("arguments")
+                else:
+                    name = getattr(fn, "name", None)
+                    arguments = getattr(fn, "arguments", None)
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                tool_use_id = self._bedrock_tool_call_attr(tc, "id", None) or self._bedrock_tool_call_attr(tc, "call_id", None)
+                if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+                    tool_use_id = self._deterministic_call_id(name, str(arguments or "{}"), len(content))
+                content.append({
+                    "toolUse": {
+                        "toolUseId": tool_use_id,
+                        "name": name.strip(),
+                        "input": self._bedrock_parse_tool_arguments(arguments),
+                    }
+                })
+            return "assistant", content
+
+        if role == "tool":
+            tool_use_id = msg.get("tool_call_id") or msg.get("id")
+            if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+                return None, []
+            result_text = self._bedrock_message_text(msg.get("content", ""))
+            return "user", [{
+                "toolResult": {
+                    "toolUseId": tool_use_id,
+                    "content": [{"text": result_text}],
+                }
+            }]
+
+        if role == "user":
+            return "user", content
+        return None, []
+
+    def _bedrock_build_converse_request(self, api_kwargs: dict, *, stream: bool = False) -> dict:
+        """Build an AWS Bedrock Converse/ConverseStream request from Hermes messages."""
+        request = {
+            "modelId": api_kwargs.get("model") or self.model,
+            "messages": [],
+            "inferenceConfig": self._bedrock_converse_inference_config(api_kwargs),
+        }
+        system_parts = []
+        for msg in api_kwargs.get("messages", []) or []:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "system":
+                text = self._bedrock_message_text(msg.get("content", ""))
+                if text:
+                    system_parts.append({"text": text})
+                continue
+            role, content = self._bedrock_converse_content_from_message(msg)
+            if role and content:
+                request["messages"].append({"role": role, "content": content})
+        if system_parts:
+            request["system"] = system_parts
+        tool_config = self._bedrock_converse_tool_config(api_kwargs.get("tools"))
+        if tool_config:
+            request["toolConfig"] = tool_config
+        if api_kwargs.get("tool_choice") is not None:
+            choice = api_kwargs["tool_choice"]
+            if isinstance(choice, str):
+                if choice == "auto":
+                    request.setdefault("toolConfig", {})["toolChoice"] = {"auto": {}}
+                elif choice == "none":
+                    pass
+                else:
+                    request.setdefault("toolConfig", {})["toolChoice"] = {"tool": {"name": choice}}
+            elif isinstance(choice, dict):
+                request.setdefault("toolConfig", {})["toolChoice"] = choice
+        return request
+
+    def _bedrock_extract_text(self, payload: dict) -> str:
+        """Extract assistant text from common Bedrock provider response shapes."""
+        if not isinstance(payload, dict):
+            return str(payload or "")
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            message = first.get("message") if isinstance(first.get("message"), dict) else {}
+            content = message.get("content", first.get("text", ""))
+            if isinstance(content, str):
+                return content
+        content = payload.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+                    elif isinstance(part.get("content"), str):
+                        parts.append(part["content"])
+            if parts:
+                return "\n".join(parts)
+        elif isinstance(content, str):
+            return content
+        for key in ("output_text", "outputText", "completion", "generation", "text"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                return value
+        output = payload.get("output")
+        if isinstance(output, dict):
+            message = output.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            parts.append(part["text"])
+                    return "\n".join(parts)
+                if isinstance(content, str):
+                    return content
+        return ""
+
+    def _bedrock_extract_stream_delta(self, payload: dict) -> str:
+        """Extract a text delta from common Bedrock streaming chunk shapes."""
+        if not isinstance(payload, dict):
+            return ""
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
+            content = delta.get("content") or first.get("text")
+            if isinstance(content, str):
+                return content
+        delta = payload.get("delta")
+        if isinstance(delta, dict):
+            text = delta.get("text") or delta.get("content")
+            if isinstance(text, str):
+                return text
+        for key in ("outputText", "output_text", "completion", "generation", "text"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                return value
+        return self._bedrock_extract_text(payload)
+
+    def _bedrock_extract_tool_calls(self, payload: dict) -> list:
+        """Extract Bedrock Converse toolUse blocks as OpenAI-style tool_calls."""
+        if not isinstance(payload, dict):
+            return []
+        tool_calls = []
+
+        def _add_tool_use(tool_use: dict):
+            if not isinstance(tool_use, dict):
+                return
+            name = tool_use.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return
+            tool_use_id = tool_use.get("toolUseId") or tool_use.get("id")
+            input_obj = tool_use.get("input", {})
+            if isinstance(input_obj, str):
+                input_text = input_obj.strip() or "{}"
+                try:
+                    parsed = json.loads(input_text)
+                    input_obj = parsed if isinstance(parsed, dict) else {"value": parsed}
+                except Exception:
+                    input_obj = {"_raw": input_text}
+            elif not isinstance(input_obj, dict):
+                input_obj = {"value": input_obj}
+            args = json.dumps(input_obj, ensure_ascii=False, separators=(",", ":"))
+            call_id = str(tool_use_id or self._deterministic_call_id(name, args, len(tool_calls)))
+            tool_calls.append(SimpleNamespace(
+                id=call_id,
+                type="function",
+                function=SimpleNamespace(name=name.strip(), arguments=args),
+            ))
+
+        # Converse payload: output.message.content[].toolUse
+        output = payload.get("output")
+        if isinstance(output, dict):
+            message = output.get("message")
+            if isinstance(message, dict):
+                for part in message.get("content") or []:
+                    if isinstance(part, dict):
+                        _add_tool_use(part.get("toolUse"))
+
+        # Direct Anthropic-style content list can also contain tool_use blocks.
+        for part in payload.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            if "toolUse" in part:
+                _add_tool_use(part.get("toolUse"))
+            elif part.get("type") in {"tool_use", "toolUse"}:
+                _add_tool_use({
+                    "toolUseId": part.get("id") or part.get("toolUseId"),
+                    "name": part.get("name"),
+                    "input": part.get("input", {}),
+                })
+        return tool_calls
+
+    def _bedrock_finish_reason(self, payload: dict, tool_calls: list | None = None) -> str:
+        if not isinstance(payload, dict):
+            return "stop"
+        choices = payload.get("choices")
+        raw = None
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            raw = choices[0].get("finish_reason") or choices[0].get("finishReason")
+        raw = raw or payload.get("stopReason") or payload.get("stop_reason") or payload.get("finishReason")
+        if raw in {"tool_use", "tool_calls"} or tool_calls:
+            return "tool_calls"
+        if raw in {"max_tokens", "length"}:
+            return "length"
+        return raw or "stop"
+
+    def _bedrock_response_to_chat_completion(self, payload: dict):
+        """Normalize a Bedrock payload to OpenAI chat-completion shape."""
+        if not isinstance(payload, dict):
+            payload = {"text": str(payload or "")}
+        tool_calls = self._bedrock_extract_tool_calls(payload)
+        finish_reason = self._bedrock_finish_reason(payload, tool_calls)
+        text = self._bedrock_extract_text(payload)
+        message = SimpleNamespace(
+            role="assistant",
+            content=text,
+            tool_calls=tool_calls or None,
+        )
+        usage_payload = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        prompt_tokens = usage_payload.get("prompt_tokens") or usage_payload.get("input_tokens") or usage_payload.get("inputTokens") or 0
+        completion_tokens = usage_payload.get("completion_tokens") or usage_payload.get("output_tokens") or usage_payload.get("outputTokens") or 0
+        total_tokens = usage_payload.get("total_tokens") or usage_payload.get("totalTokens") or (prompt_tokens + completion_tokens if (prompt_tokens or completion_tokens) else 0)
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+        return SimpleNamespace(
+            id=payload.get("id") or f"bedrock-{uuid.uuid4().hex}",
+            model=getattr(self, "model", None),
+            choices=[SimpleNamespace(index=0, message=message, finish_reason=finish_reason)],
+            usage=usage,
+        )
+
+    def _ensure_bedrock_client(self):
+        existing = getattr(self, "_bedrock_client", None)
+        if existing is not None:
+            return existing
+        try:
+            import boto3
+        except ImportError as exc:
+            raise RuntimeError(
+                "boto3 is required for provider 'bedrock'. Install Hermes with the "
+                "updated dependencies or run: pip install boto3"
+            ) from exc
+        region = getattr(self, "_bedrock_region", None) or self._bedrock_region_from_base_url(self.base_url)
+        session_kwargs = {"region_name": region}
+        profile = os.getenv("AWS_PROFILE", "").strip()
+        if profile:
+            session_kwargs["profile_name"] = profile
+        session = boto3.Session(**session_kwargs)
+        self._bedrock_client = session.client("bedrock-runtime")
+        return self._bedrock_client
+
+    def _bedrock_should_use_converse(self, api_kwargs: dict) -> bool:
+        """Use Bedrock Converse when Hermes tools are present."""
+        return bool(api_kwargs.get("tools"))
+
+    def _bedrock_converse_create(self, api_kwargs: dict):
+        """Call AWS Bedrock Runtime converse and normalize the result."""
+        client = self._ensure_bedrock_client()
+        request = self._bedrock_build_converse_request(api_kwargs)
+        response = client.converse(**request)
+        return self._bedrock_response_to_chat_completion(response)
+
+    def _bedrock_invoke_model_create(self, api_kwargs: dict):
+        """Call AWS Bedrock Runtime invoke_model/converse and normalize the result."""
+        if self._bedrock_should_use_converse(api_kwargs):
+            return self._bedrock_converse_create(api_kwargs)
+        client = self._ensure_bedrock_client()
+        request_body = json.dumps(self._bedrock_build_invoke_body(api_kwargs))
+        response = client.invoke_model(
+            modelId=api_kwargs.get("model") or self.model,
+            contentType="application/json",
+            accept="application/json",
+            body=request_body,
+        )
+        raw_body = response.get("body")
+        if hasattr(raw_body, "read"):
+            raw_text = raw_body.read().decode()
+        else:
+            raw_text = str(raw_body or "{}")
+        payload = json.loads(raw_text or "{}")
+        return self._bedrock_response_to_chat_completion(payload)
+
+    def _bedrock_converse_stream_create(self, api_kwargs: dict):
+        """Call Bedrock converse_stream and emit text deltas while preserving toolUse."""
+        client = self._ensure_bedrock_client()
+        request = self._bedrock_build_converse_request(api_kwargs, stream=True)
+        response = client.converse_stream(**request)
+        text_parts: list[str] = []
+        tool_uses: list[dict] = []
+        current_tool: dict | None = None
+        stop_reason = None
+        usage = {}
+        for event in response.get("stream", []):
+            if not isinstance(event, dict):
+                continue
+            if "metadata" in event and isinstance(event["metadata"], dict):
+                usage = event["metadata"].get("usage", usage) or usage
+                continue
+            if "messageStop" in event and isinstance(event["messageStop"], dict):
+                stop_reason = event["messageStop"].get("stopReason") or stop_reason
+                continue
+            start = event.get("contentBlockStart")
+            if isinstance(start, dict):
+                tool_use = (start.get("start") or {}).get("toolUse")
+                if isinstance(tool_use, dict):
+                    current_tool = {
+                        "toolUseId": tool_use.get("toolUseId"),
+                        "name": tool_use.get("name"),
+                        "input": "",
+                    }
+                    tool_uses.append(current_tool)
+                continue
+            delta_event = event.get("contentBlockDelta")
+            if not isinstance(delta_event, dict):
+                continue
+            delta = delta_event.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            text_delta = delta.get("text")
+            if isinstance(text_delta, str) and text_delta:
+                text_parts.append(text_delta)
+                self._fire_stream_delta(text_delta)
+            tool_delta = delta.get("toolUse")
+            if isinstance(tool_delta, dict):
+                if current_tool is None:
+                    current_tool = {"toolUseId": None, "name": None, "input": ""}
+                    tool_uses.append(current_tool)
+                input_delta = tool_delta.get("input")
+                if isinstance(input_delta, str):
+                    current_tool["input"] = str(current_tool.get("input") or "") + input_delta
+
+        content = [{"text": "".join(text_parts)}] if text_parts else []
+        for tool_use in tool_uses:
+            raw_input = tool_use.get("input", "")
+            try:
+                parsed_input = json.loads(raw_input or "{}")
+                if not isinstance(parsed_input, dict):
+                    parsed_input = {"value": parsed_input}
+            except Exception:
+                parsed_input = {"_raw": raw_input}
+            content.append({
+                "toolUse": {
+                    "toolUseId": tool_use.get("toolUseId"),
+                    "name": tool_use.get("name"),
+                    "input": parsed_input,
+                }
+            })
+        return self._bedrock_response_to_chat_completion({
+            "output": {"message": {"role": "assistant", "content": content}},
+            "stopReason": stop_reason or ("tool_use" if tool_uses else "end_turn"),
+            "usage": usage,
+        })
+
+    def _bedrock_invoke_model_stream_create(self, api_kwargs: dict):
+        """Call Bedrock streaming APIs and emit text deltas."""
+        if self._bedrock_should_use_converse(api_kwargs):
+            return self._bedrock_converse_stream_create(api_kwargs)
+        client = self._ensure_bedrock_client()
+        request_body = json.dumps(self._bedrock_build_invoke_body(api_kwargs))
+        response = client.invoke_model_with_response_stream(
+            modelId=api_kwargs.get("model") or self.model,
+            contentType="application/json",
+            accept="application/json",
+            body=request_body,
+        )
+        parts = []
+        for event in response.get("body", []):
+            chunk = event.get("chunk") if isinstance(event, dict) else None
+            if not isinstance(chunk, dict):
+                continue
+            raw = chunk.get("bytes", b"")
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            try:
+                payload = json.loads(raw or "{}")
+            except Exception:
+                continue
+            delta = self._bedrock_extract_stream_delta(payload)
+            if delta:
+                parts.append(delta)
+                self._fire_stream_delta(delta)
+        return self._bedrock_response_to_chat_completion({"text": "".join(parts)})
+
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
+        if self.api_mode == "bedrock_invoke":
+            api_kwargs = {
+                "model": self.model,
+                "messages": api_messages,
+                "timeout": float(os.getenv("HERMES_API_TIMEOUT", 1800.0)),
+            }
+            if self.max_tokens is not None:
+                api_kwargs["max_tokens"] = self.max_tokens
+            if self.tools:
+                api_kwargs["tools"] = self.tools
+            if self.request_overrides:
+                api_kwargs.update(self.request_overrides)
+            return api_kwargs
+
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_kwargs
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)

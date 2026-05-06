@@ -13,6 +13,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
+    from hermes_constants import get_hermes_home
+except ImportError:
+    import os as _os
+    def get_hermes_home() -> Path:  # type: ignore[misc]
+        val = (_os.environ.get("HERMES_HOME") or "").strip()
+        return Path(val) if val else Path.home() / ".hermes"
+
+try:
     from fastapi import APIRouter
 except Exception:  # Allows local unit tests without dashboard dependencies.
     class APIRouter:  # type: ignore

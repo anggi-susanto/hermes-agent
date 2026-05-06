@@ -2,51 +2,27 @@
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
-import sys
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import PlatformConfig
 
 
-def _ensure_discord_mock():
-    """Install a mock discord module when discord.py isn't available."""
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
-        return
-
-    discord_mod = MagicMock()
-    discord_mod.Intents.default.return_value = MagicMock()
-    discord_mod.Client = MagicMock
-    discord_mod.File = MagicMock
-    discord_mod.DMChannel = type("DMChannel", (), {})
-    discord_mod.Thread = type("Thread", (), {})
-    discord_mod.ForumChannel = type("ForumChannel", (), {})
-    discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
-    discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
-    discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
-    discord_mod.Interaction = object
-    discord_mod.Embed = MagicMock
-    discord_mod.app_commands = SimpleNamespace(
-        describe=lambda **kwargs: (lambda fn: fn),
-        choices=lambda **kwargs: (lambda fn: fn),
-        Choice=lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-
-    ext_mod = MagicMock()
-    commands_mod = MagicMock()
-    commands_mod.Bot = MagicMock
-    ext_mod.commands = commands_mod
-
-    sys.modules.setdefault("discord", discord_mod)
-    sys.modules.setdefault("discord.ext", ext_mod)
-    sys.modules.setdefault("discord.ext.commands", commands_mod)
+from tests.gateway.conftest import _ensure_discord_mock
 
 
 _ensure_discord_mock()
 
 import gateway.platforms.discord as discord_platform  # noqa: E402
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _sync_discord_module_global():
+    discord_mod = _ensure_discord_mock()
+    discord_platform.discord = discord_mod
+    discord_platform.DISCORD_AVAILABLE = True
 
 
 class FakeDMChannel:
@@ -96,7 +72,7 @@ def adapter(monkeypatch):
     return adapter
 
 
-def make_message(*, channel, content: str, mentions=None):
+def make_message(*, channel, content: str, mentions=None, msg_type=None):
     author = SimpleNamespace(id=42, display_name="Jezza", name="Jezza")
     return SimpleNamespace(
         id=123,
@@ -107,6 +83,7 @@ def make_message(*, channel, content: str, mentions=None):
         created_at=datetime.now(timezone.utc),
         channel=channel,
         author=author,
+        type=msg_type if msg_type is not None else discord_platform.discord.MessageType.default,
     )
 
 
@@ -205,6 +182,21 @@ async def test_discord_free_response_channel_overrides_mention_requirement(adapt
 
 
 @pytest.mark.asyncio
+async def test_discord_free_response_channel_can_come_from_config_extra(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["free_response_channels"] = ["789", "999"]
+
+    message = make_message(channel=FakeTextChannel(channel_id=789), content="allowed from config")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "allowed from config"
+
+
+@pytest.mark.asyncio
 async def test_discord_forum_parent_in_free_response_list_allows_forum_thread(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "222")
@@ -274,6 +266,31 @@ async def test_discord_auto_thread_enabled_by_default(adapter, monkeypatch):
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "999"
+
+
+@pytest.mark.asyncio
+async def test_discord_reply_message_skips_auto_thread(adapter, monkeypatch):
+    """Quote-replies should stay in-channel instead of trying to create a thread."""
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "123")
+
+    adapter._auto_create_thread = AsyncMock()
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123),
+        content="reply without mention",
+        msg_type=discord_platform.discord.MessageType.reply,
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "reply without mention"
+    assert event.source.chat_id == "123"
+    assert event.source.chat_type == "group"
 
 
 @pytest.mark.asyncio
@@ -382,6 +399,33 @@ async def test_discord_voice_linked_channel_skips_mention_requirement_and_auto_t
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "follow-up from voice text chat"
+    assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_channel_skips_auto_thread(adapter, monkeypatch):
+    """Free-response channels must NOT auto-create threads — bot replies inline.
+
+    Without this, every message in a free-response channel would spin off a
+    thread (since the channel bypasses the @mention gate), defeating the
+    lightweight-chat purpose of free-response mode.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)  # default true
+
+    adapter._auto_create_thread = AsyncMock()
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="free chat message",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "group"
 
 

@@ -3,14 +3,14 @@ from hermes_cli import providers
 from hermes_cli import runtime_provider as rp
 
 
-def test_bedrock_provider_is_builtin_with_bedrock_invoke_mode():
+def test_bedrock_provider_is_builtin_with_bedrock_converse_mode():
     pdef = providers.get_provider("bedrock")
 
     assert pdef is not None
     assert pdef.id == "bedrock"
-    assert pdef.transport == "bedrock_invoke"
-    assert pdef.auth_type == "aws"
-    assert providers.determine_api_mode("bedrock") == "bedrock_invoke"
+    assert pdef.transport == "bedrock_converse"
+    assert pdef.auth_type == "aws_sdk"
+    assert providers.determine_api_mode("bedrock") == "bedrock_converse"
 
 
 def test_runtime_provider_resolves_bedrock_from_aws_env(monkeypatch):
@@ -27,11 +27,11 @@ def test_runtime_provider_resolves_bedrock_from_aws_env(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="bedrock")
 
     assert resolved["provider"] == "bedrock"
-    assert resolved["api_mode"] == "bedrock_invoke"
+    assert resolved["api_mode"] == "bedrock_converse"
     assert resolved["model"] == "deepseek.v3.2"
     assert resolved["region"] == "ap-southeast-3"
-    assert resolved["api_key"] == "aws-env"
-    assert resolved["base_url"] == "bedrock://ap-southeast-3"
+    assert resolved["api_key"] == "aws-sdk"
+    assert resolved["base_url"] == "https://bedrock-runtime.ap-southeast-3.amazonaws.com"
 
 
 def test_bedrock_build_invoke_body_uses_deepseek_message_shape():

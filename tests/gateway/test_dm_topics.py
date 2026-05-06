@@ -22,10 +22,10 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
+    telegram_mod = sys.modules.get("telegram")
+    if telegram_mod is None or not hasattr(telegram_mod, "__file__"):
+        telegram_mod = MagicMock()
 
-    telegram_mod = MagicMock()
     telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
     telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
     telegram_mod.constants.ChatType.GROUP = "group"
@@ -33,13 +33,30 @@ def _ensure_telegram_mock():
     telegram_mod.constants.ChatType.CHANNEL = "channel"
     telegram_mod.constants.ChatType.PRIVATE = "private"
 
+    # telegram.py imports from ``telegram.constants`` into module globals. In
+    # full-suite runs, other tests can leave a partial telegram mock in
+    # sys.modules, so force all import aliases to share this fully populated
+    # object instead of using setdefault and inheriting stale state.
+    telegram_mod.ParseMode = telegram_mod.constants.ParseMode
+    telegram_mod.ChatType = telegram_mod.constants.ChatType
     for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, telegram_mod)
+        sys.modules[name] = telegram_mod
+    return telegram_mod
 
 
 _ensure_telegram_mock()
 
 from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _sync_telegram_module_global():
+    telegram_mod = _ensure_telegram_mock()
+    import gateway.platforms.telegram as telegram_adapter
+
+    telegram_adapter.ParseMode = telegram_mod.constants.ParseMode
+    telegram_adapter.ChatType = telegram_mod.constants.ChatType
+    telegram_adapter.TELEGRAM_AVAILABLE = True
 
 
 def _make_adapter(dm_topics_config=None, group_topics_config=None):
@@ -283,6 +300,48 @@ def test_persist_dm_topic_thread_id_skips_if_already_set(tmp_path):
 # ── _get_dm_topic_info ──
 
 
+def test_persist_dm_topic_thread_id_preserves_config_on_write_failure(tmp_path):
+    """Failed writes should leave the original config.yaml intact."""
+    import yaml
+
+    config_data = {
+        "platforms": {
+            "telegram": {
+                "extra": {
+                    "dm_topics": [
+                        {
+                            "chat_id": 111,
+                            "topics": [
+                                {"name": "General", "icon_color": 123},
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    config_file = tmp_path / ".hermes" / "config.yaml"
+    config_file.parent.mkdir(parents=True)
+    original_text = yaml.dump(config_data)
+    config_file.write_text(original_text, encoding="utf-8")
+
+    adapter = _make_adapter()
+
+    def fail_dump(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    with patch.object(Path, "home", return_value=tmp_path), \
+         patch.dict(os.environ, {"HERMES_HOME": str(tmp_path / ".hermes")}), \
+         patch("yaml.dump", side_effect=fail_dump):
+        adapter._persist_dm_topic_thread_id(111, "General", 999)
+
+    assert config_file.read_text(encoding="utf-8") == original_text
+    result = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    topics = result["platforms"]["telegram"]["extra"]["dm_topics"][0]["topics"]
+    assert "thread_id" not in topics[0]
+
+
 def test_get_dm_topic_info_finds_cached_topic():
     """Should return topic config when thread_id is in cache."""
     adapter = _make_adapter([
@@ -491,11 +550,11 @@ def test_build_message_event_no_auto_skill_without_thread():
 
 # ── _build_message_event: group_topics skill binding ──
 
-# The telegram mock sets sys.modules["telegram.constants"] = telegram_mod (root mock),
-# so `from telegram.constants import ChatType` in telegram.py resolves to
-# telegram_mod.ChatType — not telegram_mod.constants.ChatType.  We must use
-# the same ChatType object the production code sees so equality checks work.
-from telegram.constants import ChatType as _ChatType  # noqa: E402
+def _chat_type():
+    """Return the ChatType object currently cached by the adapter module."""
+    import gateway.platforms.telegram as telegram_adapter
+
+    return telegram_adapter.ChatType
 
 
 def test_group_topic_skill_binding():
@@ -513,7 +572,7 @@ def test_group_topic_skill_binding():
     ])
 
     msg = _make_mock_message(
-        chat_id=-1001234567890, chat_type=_ChatType.SUPERGROUP, thread_id=5, text="hello"
+        chat_id=-1001234567890, chat_type=_chat_type().SUPERGROUP, thread_id=5, text="hello"
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
@@ -536,7 +595,7 @@ def test_group_topic_skill_binding_second_topic():
     ])
 
     msg = _make_mock_message(
-        chat_id=-1001234567890, chat_type=_ChatType.SUPERGROUP, thread_id=12, text="deal update"
+        chat_id=-1001234567890, chat_type=_chat_type().SUPERGROUP, thread_id=12, text="deal update"
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
@@ -558,7 +617,7 @@ def test_group_topic_no_skill_binding():
     ])
 
     msg = _make_mock_message(
-        chat_id=-1001234567890, chat_type=_ChatType.SUPERGROUP, thread_id=1, text="hey"
+        chat_id=-1001234567890, chat_type=_chat_type().SUPERGROUP, thread_id=1, text="hey"
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
@@ -580,7 +639,7 @@ def test_group_topic_unmapped_thread_id():
     ])
 
     msg = _make_mock_message(
-        chat_id=-1001234567890, chat_type=_ChatType.SUPERGROUP, thread_id=999, text="random"
+        chat_id=-1001234567890, chat_type=_chat_type().SUPERGROUP, thread_id=999, text="random"
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
@@ -602,7 +661,7 @@ def test_group_topic_unmapped_chat_id():
     ])
 
     msg = _make_mock_message(
-        chat_id=-1009999999999, chat_type=_ChatType.SUPERGROUP, thread_id=5, text="wrong group"
+        chat_id=-1009999999999, chat_type=_chat_type().SUPERGROUP, thread_id=5, text="wrong group"
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
@@ -617,7 +676,7 @@ def test_group_topic_no_config():
     adapter = _make_adapter()  # no group_topics_config
 
     msg = _make_mock_message(
-        chat_id=-1001234567890, chat_type=_ChatType.GROUP, thread_id=5, text="hi"
+        chat_id=-1001234567890, chat_type=_chat_type().GROUP, thread_id=5, text="hi"
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
@@ -639,9 +698,60 @@ def test_group_topic_chat_id_int_string_coercion():
     ])
 
     msg = _make_mock_message(
-        chat_id=-1001234567890, chat_type=_ChatType.SUPERGROUP, thread_id=7, text="test"
+        chat_id=-1001234567890, chat_type=_chat_type().SUPERGROUP, thread_id=7, text="test"
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
     assert event.auto_skill == "hermes-agent-dev"
     assert event.source.chat_topic == "Dev"
+
+
+# ── _build_message_event: from_user=None fallback in DMs ──
+
+
+def test_build_message_event_dm_from_user_none_falls_back_to_chat_id():
+    """When from_user is None in a DM, user_id should fall back to chat.id."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_mock_message(chat_id=12345, user_id=42, user_name="Alice")
+    # Simulate from_user being None (edge case on fresh restart / forwarded msg)
+    msg.from_user = None
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    # Should fall back to chat.id since chat_type is "dm"
+    assert event.source.user_id == "12345"
+    assert event.source.user_name == "Alice"  # falls back to chat.full_name
+
+
+def test_build_message_event_group_from_user_none_stays_none():
+    """When from_user is None in a group, user_id should remain None."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_mock_message(
+        chat_id=-1001234567890, chat_type=_chat_type().SUPERGROUP,
+        user_id=42, user_name="Alice"
+    )
+    msg.from_user = None
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    # Groups should NOT fall back — anonymous senders stay None
+    assert event.source.user_id is None
+    assert event.source.user_name is None
+
+
+def test_build_message_event_dm_from_user_present_uses_user():
+    """When from_user is present in a DM, it should be used (no fallback)."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_mock_message(chat_id=12345, user_id=99999, user_name="Bob")
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    # Normal case — from_user is used directly
+    assert event.source.user_id == "99999"
+    assert event.source.user_name == "Bob"

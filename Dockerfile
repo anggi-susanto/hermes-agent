@@ -10,10 +10,9 @@ ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 
 # Install system dependencies in one layer, clear APT cache
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git && \
-    rm -rf /var/lib/apt/lists/*
+# tini reaps orphaned zombie processes (MCP stdio subprocesses, git, bun, etc.)
+# that would otherwise accumulate when hermes runs as PID 1. See #15012.
+RUN apt-get update &&     apt-get install -y --no-install-recommends     build-essential curl nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli tini &&     rm -rf /var/lib/apt/lists/*
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
@@ -21,27 +20,39 @@ RUN useradd -u 10000 -m -d /opt/data hermes
 COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
-COPY . /opt/hermes
 WORKDIR /opt/hermes
 
-# Install Node dependencies and Playwright as root (--with-deps needs apt)
-RUN npm install --prefer-offline --no-audit && \
-    npx playwright install --with-deps chromium --only-shell && \
-    cd /opt/hermes/scripts/whatsapp-bridge && \
-    npm install --prefer-offline --no-audit && \
-    npm cache clean --force
+# ---------- Layer-cached dependency install ----------
+# Copy only package manifests first so npm install + Playwright are cached
+# unless the lockfiles themselves change.
+COPY package.json package-lock.json ./
+COPY web/package.json web/package-lock.json web/
+COPY ui-tui/package.json ui-tui/package-lock.json ui-tui/
+COPY ui-tui/packages/hermes-ink/package.json ui-tui/packages/hermes-ink/package-lock.json ui-tui/packages/hermes-ink/
 
-# Hand ownership to hermes user, prepare virtualenv path, then install Python deps
-RUN mkdir -p /opt/hermes-venv && \
-    chown -R hermes:hermes /opt/hermes /opt/hermes-venv
-USER hermes
+RUN npm install --prefer-offline --no-audit &&     npx playwright install --with-deps chromium --only-shell &&     (cd web && npm install --prefer-offline --no-audit) &&     (cd ui-tui && npm install --prefer-offline --no-audit) &&     npm cache clean --force
 
-RUN uv venv /opt/hermes-venv && \
-    uv pip install --python /opt/hermes-venv/bin/python --no-cache-dir -e ".[all]"
+# ---------- Source code ----------
+# .dockerignore excludes node_modules, so the installs above survive.
+COPY --chown=hermes:hermes . .
 
+# Build browser dashboard and terminal UI assets.
+RUN cd web && npm run build &&     cd ../ui-tui && npm run build &&     rm -rf node_modules/@hermes/ink &&     rm -rf packages/hermes-ink/node_modules &&     cp -R packages/hermes-ink node_modules/@hermes/ink &&     npm install --omit=dev --prefer-offline --no-audit --prefix node_modules/@hermes/ink &&     rm -rf node_modules/@hermes/ink/node_modules/react &&     node --input-type=module -e "await import('@hermes/ink')"
+
+# ---------- Permissions + Python virtualenv ----------
+# Keep the venv outside /opt/hermes so runtime entrypoint activation survives
+# image layout changes and matches docker/entrypoint.sh.
 USER root
-RUN chmod +x /opt/hermes/docker/entrypoint.sh
+RUN mkdir -p /opt/hermes-venv &&     chown -R hermes:hermes /opt/hermes /opt/hermes-venv &&     chmod -R a+rX /opt/hermes
+USER hermes
+RUN uv venv /opt/hermes-venv &&     uv pip install --python /opt/hermes-venv/bin/python --no-cache-dir -e ".[all]"
+USER root
+# Start as root so the entrypoint can usermod/groupmod + gosu.
+# If HERMES_UID is unset, the entrypoint drops to the default hermes user (10000).
 
+# ---------- Runtime ----------
+ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_HOME=/opt/data
+ENV PATH="/opt/data/.local/bin:/opt/hermes-venv/bin:${PATH}"
 VOLUME [ "/opt/data" ]
-ENTRYPOINT [ "/opt/hermes/docker/entrypoint.sh" ]
+ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]

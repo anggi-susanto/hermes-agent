@@ -1,10 +1,30 @@
 """Tests for Discord system message filtering (thread renames, pins, etc.)."""
 
-import pytest
 import unittest
 from unittest.mock import MagicMock
 
-discord = pytest.importorskip("discord")
+# Avoid depending on whichever discord.py or lightweight discord mock another
+# full-suite test left in sys.modules. This regression only needs stable,
+# comparable message-type sentinels.
+discord = type(
+    "FakeDiscordModule",
+    (),
+    {
+        "MessageType": type(
+            "MessageType",
+            (),
+            {
+                "default": "default",
+                "reply": "reply",
+                "channel_name_change": "channel_name_change",
+                "pins_add": "pins_add",
+                "new_member": "new_member",
+                "premium_guild_subscription": "premium_guild_subscription",
+                "recipient_add": "recipient_add",
+            },
+        )
+    },
+)()
 
 
 def _make_author(*, bot: bool = False, is_self: bool = False):

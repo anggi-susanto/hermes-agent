@@ -4,9 +4,11 @@ Covers the threading behavior control for multi-chunk replies:
 - "off": Never reply-reference to original message
 - "first": Only first chunk uses reply reference (default)
 - "all": All chunks reply-reference the original message
+
+Also covers reply_to_text extraction from incoming messages.
 """
 import os
-import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -15,42 +17,22 @@ import pytest
 from gateway.config import PlatformConfig, GatewayConfig, Platform, _apply_env_overrides
 
 
-def _ensure_discord_mock():
-    """Install a mock discord module when discord.py isn't available."""
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
-        return
-
-    discord_mod = MagicMock()
-    discord_mod.Intents.default.return_value = MagicMock()
-    discord_mod.Client = MagicMock
-    discord_mod.File = MagicMock
-    discord_mod.DMChannel = type("DMChannel", (), {})
-    discord_mod.Thread = type("Thread", (), {})
-    discord_mod.ForumChannel = type("ForumChannel", (), {})
-    discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
-    discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
-    discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
-    discord_mod.Interaction = object
-    discord_mod.Embed = MagicMock
-    discord_mod.app_commands = SimpleNamespace(
-        describe=lambda **kwargs: (lambda fn: fn),
-        choices=lambda **kwargs: (lambda fn: fn),
-        Choice=lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-
-    ext_mod = MagicMock()
-    commands_mod = MagicMock()
-    commands_mod.Bot = MagicMock
-    ext_mod.commands = commands_mod
-
-    sys.modules.setdefault("discord", discord_mod)
-    sys.modules.setdefault("discord.ext", ext_mod)
-    sys.modules.setdefault("discord.ext.commands", commands_mod)
+from tests.gateway.conftest import _ensure_discord_mock
 
 
 _ensure_discord_mock()
 
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _sync_discord_module_global():
+    discord_mod = _ensure_discord_mock()
+    import gateway.platforms.discord as discord_adapter
+
+    discord_adapter.discord = discord_mod
+    discord_adapter.DISCORD_AVAILABLE = True
+    discord_mod.DMChannel = FakeDMChannelBase
 
 
 @pytest.fixture()
@@ -102,9 +84,14 @@ def _make_discord_adapter(reply_to_mode: str = "first"):
     config = PlatformConfig(enabled=True, token="test-token", reply_to_mode=reply_to_mode)
     adapter = DiscordAdapter(config)
 
-    # Mock the Discord client and channel
+    # Mock the Discord client and channel.
+    # ref_message.to_reference() → a distinct sentinel: the adapter now wraps
+    # the fetched Message via to_reference(fail_if_not_exists=False) so a
+    # deleted target degrades to "send without reply chip" instead of a 400.
     mock_channel = AsyncMock()
     ref_message = MagicMock()
+    ref_reference = MagicMock(name="MessageReference")
+    ref_message.to_reference = MagicMock(return_value=ref_reference)
     mock_channel.fetch_message = AsyncMock(return_value=ref_message)
 
     sent_msg = MagicMock()
@@ -115,7 +102,9 @@ def _make_discord_adapter(reply_to_mode: str = "first"):
     mock_client.get_channel = MagicMock(return_value=mock_channel)
 
     adapter._client = mock_client
-    return adapter, mock_channel, ref_message
+    # Return the reference sentinel alongside so tests can assert identity.
+    adapter._test_expected_reference = ref_reference
+    return adapter, mock_channel, ref_reference
 
 
 class TestSendWithReplyToMode:
@@ -275,3 +264,108 @@ class TestEnvVarOverride:
             _apply_env_overrides(config)
         assert Platform.DISCORD in config.platforms
         assert config.platforms[Platform.DISCORD].reply_to_mode == "off"
+
+
+# ------------------------------------------------------------------
+# Tests for reply_to_text extraction in _handle_message
+# ------------------------------------------------------------------
+
+class FakeDMChannelBase:
+    """Stable base that the test and adapter mock both share."""
+
+
+class FakeDMChannel(FakeDMChannelBase):
+    """Minimal DM channel stub (skips mention / channel-allow checks)."""
+    def __init__(self, channel_id: int = 100, name: str = "dm"):
+        # Do NOT call super().__init__() — real DMChannel requires State
+        self.id = channel_id
+        self.name = name
+
+
+def _make_message(*, content: str = "hi", reference=None):
+    """Build a mock Discord message for _handle_message tests."""
+    author = SimpleNamespace(id=42, display_name="TestUser", name="TestUser")
+    return SimpleNamespace(
+        id=999,
+        content=content,
+        mentions=[],
+        attachments=[],
+        reference=reference,
+        created_at=datetime.now(timezone.utc),
+        channel=FakeDMChannel(),
+        author=author,
+    )
+
+
+@pytest.fixture
+def reply_text_adapter(monkeypatch):
+    """DiscordAdapter wired for _handle_message → handle_message capture."""
+    config = PlatformConfig(enabled=True, token="fake-token")
+    adapter = DiscordAdapter(config)
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+    adapter._text_batch_delay_seconds = 0
+    adapter.handle_message = AsyncMock()
+    return adapter
+
+
+class TestReplyToText:
+    """Tests for reply_to_text populated by _handle_message."""
+
+    @pytest.mark.asyncio
+    async def test_no_reference_both_none(self, reply_text_adapter):
+        message = _make_message(reference=None)
+
+        await reply_text_adapter._handle_message(message)
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_message_id is None
+        assert event.reply_to_text is None
+
+    @pytest.mark.asyncio
+    async def test_reference_without_resolved(self, reply_text_adapter):
+        ref = SimpleNamespace(message_id=555, resolved=None)
+        message = _make_message(reference=ref)
+
+        await reply_text_adapter._handle_message(message)
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_message_id == "555"
+        assert event.reply_to_text is None
+
+    @pytest.mark.asyncio
+    async def test_reference_with_resolved_content(self, reply_text_adapter):
+        resolved_msg = SimpleNamespace(content="original message text")
+        ref = SimpleNamespace(message_id=555, resolved=resolved_msg)
+        message = _make_message(reference=ref)
+
+        await reply_text_adapter._handle_message(message)
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_message_id == "555"
+        assert event.reply_to_text == "original message text"
+
+    @pytest.mark.asyncio
+    async def test_reference_with_empty_resolved_content(self, reply_text_adapter):
+        """Empty string content should become None, not leak as empty string."""
+        resolved_msg = SimpleNamespace(content="")
+        ref = SimpleNamespace(message_id=555, resolved=resolved_msg)
+        message = _make_message(reference=ref)
+
+        await reply_text_adapter._handle_message(message)
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_message_id == "555"
+        assert event.reply_to_text is None
+
+    @pytest.mark.asyncio
+    async def test_reference_with_deleted_message(self, reply_text_adapter):
+        """Deleted messages lack .content — getattr guard should return None."""
+        resolved_deleted = SimpleNamespace(id=555)
+        ref = SimpleNamespace(message_id=555, resolved=resolved_deleted)
+        message = _make_message(reference=ref)
+
+        await reply_text_adapter._handle_message(message)
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_message_id == "555"
+        assert event.reply_to_text is None

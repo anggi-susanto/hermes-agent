@@ -21,6 +21,8 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter, cors_middleware
 from gateway.platforms.api_server_alerts import API_SERVER_ADAPTER_KEY
 
+_MOD = "gateway.platforms.api_server"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,10 +86,10 @@ class TestListJobs:
         """GET /api/jobs returns job list."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_list", return_value=[SAMPLE_JOB]
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_list", return_value=[SAMPLE_JOB]
             ):
                 resp = await cli.get("/api/jobs")
                 assert resp.status == 200
@@ -105,10 +107,10 @@ class TestListJobs:
         app = _create_app(adapter)
         mock_list = MagicMock(return_value=[SAMPLE_JOB])
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_list", mock_list
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_list", mock_list
             ):
                 resp = await cli.get("/api/jobs?include_disabled=true")
                 assert resp.status == 200
@@ -120,10 +122,10 @@ class TestListJobs:
         app = _create_app(adapter)
         mock_list = MagicMock(return_value=[])
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_list", mock_list
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_list", mock_list
             ):
                 resp = await cli.get("/api/jobs")
                 assert resp.status == 200
@@ -141,10 +143,10 @@ class TestCreateJob:
         app = _create_app(adapter)
         mock_create = MagicMock(return_value=SAMPLE_JOB)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_create", mock_create
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
             ):
                 resp = await cli.post("/api/jobs", json={
                     "name": "test-job",
@@ -165,7 +167,7 @@ class TestCreateJob:
         """POST /api/jobs without name returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.post("/api/jobs", json={
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
@@ -179,7 +181,7 @@ class TestCreateJob:
         """POST /api/jobs with name > 200 chars returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.post("/api/jobs", json={
                     "name": "x" * 201,
                     "schedule": "*/5 * * * *",
@@ -193,7 +195,7 @@ class TestCreateJob:
         """POST /api/jobs with prompt > 5000 chars returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.post("/api/jobs", json={
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
@@ -208,7 +210,7 @@ class TestCreateJob:
         """POST /api/jobs with repeat=0 returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.post("/api/jobs", json={
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
@@ -223,7 +225,7 @@ class TestCreateJob:
         """POST /api/jobs without schedule returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.post("/api/jobs", json={
                     "name": "test-job",
                 })
@@ -243,10 +245,10 @@ class TestGetJob:
         app = _create_app(adapter)
         mock_get = MagicMock(return_value=SAMPLE_JOB)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_get", mock_get
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_get", mock_get
             ):
                 resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 200
@@ -260,10 +262,10 @@ class TestGetJob:
         app = _create_app(adapter)
         mock_get = MagicMock(return_value=None)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_get", mock_get
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_get", mock_get
             ):
                 resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 404
@@ -273,7 +275,7 @@ class TestGetJob:
         """GET /api/jobs/{id} with non-hex id returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.get("/api/jobs/not-a-valid-hex!")
                 assert resp.status == 400
                 data = await resp.json()
@@ -292,10 +294,10 @@ class TestUpdateJob:
         updated_job = {**SAMPLE_JOB, "name": "updated-name"}
         mock_update = MagicMock(return_value=updated_job)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_update", mock_update
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
             ):
                 resp = await cli.patch(
                     f"/api/jobs/{VALID_JOB_ID}",
@@ -318,10 +320,10 @@ class TestUpdateJob:
         updated_job = {**SAMPLE_JOB, "name": "new-name"}
         mock_update = MagicMock(return_value=updated_job)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_update", mock_update
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
             ):
                 resp = await cli.patch(
                     f"/api/jobs/{VALID_JOB_ID}",
@@ -343,7 +345,7 @@ class TestUpdateJob:
         """PATCH /api/jobs/{id} with only unknown fields returns 400."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.patch(
                     f"/api/jobs/{VALID_JOB_ID}",
                     json={"evil_field": "malicious"},
@@ -364,10 +366,10 @@ class TestDeleteJob:
         app = _create_app(adapter)
         mock_remove = MagicMock(return_value=True)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_remove", mock_remove
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_remove", mock_remove
             ):
                 resp = await cli.delete(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 200
@@ -381,10 +383,10 @@ class TestDeleteJob:
         app = _create_app(adapter)
         mock_remove = MagicMock(return_value=False)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_remove", mock_remove
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_remove", mock_remove
             ):
                 resp = await cli.delete(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 404
@@ -402,10 +404,10 @@ class TestPauseJob:
         paused_job = {**SAMPLE_JOB, "enabled": False}
         mock_pause = MagicMock(return_value=paused_job)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_pause", mock_pause
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_pause", mock_pause
             ):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
                 assert resp.status == 200
@@ -427,10 +429,10 @@ class TestResumeJob:
         resumed_job = {**SAMPLE_JOB, "enabled": True}
         mock_resume = MagicMock(return_value=resumed_job)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_resume", mock_resume
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_resume", mock_resume
             ):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/resume")
                 assert resp.status == 200
@@ -452,10 +454,10 @@ class TestRunJob:
         triggered_job = {**SAMPLE_JOB, "last_run": "2025-01-01T00:00:00Z"}
         mock_trigger = MagicMock(return_value=triggered_job)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_trigger", mock_trigger
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
             ):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 200
@@ -474,7 +476,7 @@ class TestAuthRequired:
         """GET /api/jobs without API key returns 401 when key is set."""
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.get("/api/jobs")
                 assert resp.status == 401
 
@@ -483,7 +485,7 @@ class TestAuthRequired:
         """POST /api/jobs without API key returns 401 when key is set."""
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.post("/api/jobs", json={
                     "name": "test", "schedule": "* * * * *",
                 })
@@ -494,7 +496,7 @@ class TestAuthRequired:
         """GET /api/jobs/{id} without API key returns 401 when key is set."""
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 401
 
@@ -503,7 +505,7 @@ class TestAuthRequired:
         """DELETE /api/jobs/{id} without API key returns 401."""
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
                 resp = await cli.delete(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 401
 
@@ -513,10 +515,10 @@ class TestAuthRequired:
         app = _create_app(auth_adapter)
         mock_list = MagicMock(return_value=[])
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                APIServerAdapter, "_CRON_AVAILABLE", True
-            ), patch.object(
-                APIServerAdapter, "_cron_list", mock_list
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_list", mock_list
             ):
                 resp = await cli.get(
                     "/api/jobs",
@@ -535,7 +537,7 @@ class TestCronUnavailable:
         """GET /api/jobs returns 501 when _CRON_AVAILABLE is False."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", False):
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
                 resp = await cli.get("/api/jobs")
                 assert resp.status == 501
                 data = await resp.json()
@@ -552,8 +554,8 @@ class TestCronUnavailable:
             return SAMPLE_JOB
 
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True), patch.object(
-                APIServerAdapter, "_cron_pause", staticmethod(_plain_pause)
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_pause", _plain_pause
             ):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
                 assert resp.status == 200
@@ -572,8 +574,8 @@ class TestCronUnavailable:
             return [SAMPLE_JOB]
 
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True), patch.object(
-                APIServerAdapter, "_cron_list", staticmethod(_plain_list)
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_list", _plain_list
             ):
                 resp = await cli.get("/api/jobs?include_disabled=true")
                 assert resp.status == 200
@@ -594,8 +596,8 @@ class TestCronUnavailable:
             return updated_job
 
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True), patch.object(
-                APIServerAdapter, "_cron_update", staticmethod(_plain_update)
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", _plain_update
             ):
                 resp = await cli.patch(
                     f"/api/jobs/{VALID_JOB_ID}",
@@ -612,7 +614,7 @@ class TestCronUnavailable:
         """POST /api/jobs returns 501 when _CRON_AVAILABLE is False."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", False):
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
                 resp = await cli.post("/api/jobs", json={
                     "name": "test", "schedule": "* * * * *",
                 })
@@ -623,7 +625,7 @@ class TestCronUnavailable:
         """GET /api/jobs/{id} returns 501 when _CRON_AVAILABLE is False."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", False):
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
                 resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 501
 
@@ -632,7 +634,7 @@ class TestCronUnavailable:
         """DELETE /api/jobs/{id} returns 501 when _CRON_AVAILABLE is False."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", False):
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
                 resp = await cli.delete(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 501
 
@@ -641,7 +643,7 @@ class TestCronUnavailable:
         """POST /api/jobs/{id}/pause returns 501 when _CRON_AVAILABLE is False."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", False):
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
                 assert resp.status == 501
 
@@ -650,7 +652,7 @@ class TestCronUnavailable:
         """POST /api/jobs/{id}/resume returns 501 when _CRON_AVAILABLE is False."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", False):
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/resume")
                 assert resp.status == 501
 
@@ -659,6 +661,6 @@ class TestCronUnavailable:
         """POST /api/jobs/{id}/run returns 501 when _CRON_AVAILABLE is False."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", False):
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 501

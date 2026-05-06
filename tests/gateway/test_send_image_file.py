@@ -173,24 +173,23 @@ class TestTelegramSendImageFile:
 # ---------------------------------------------------------------------------
 
 
-def _ensure_discord_mock():
-    """Install mock discord module so DiscordAdapter can be imported."""
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
-        return
-
-    discord_mod = MagicMock()
-    discord_mod.Intents.default.return_value = MagicMock()
-    discord_mod.Client = MagicMock
-    discord_mod.File = MagicMock
-
-    for name in ("discord", "discord.ext", "discord.ext.commands"):
-        sys.modules.setdefault(name, discord_mod)
+from tests.gateway.conftest import _ensure_discord_mock
 
 
 _ensure_discord_mock()
 
 import discord as discord_mod_ref  # noqa: E402
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _sync_discord_module_global():
+    discord_mod = _ensure_discord_mock()
+    import gateway.platforms.discord as discord_adapter
+
+    discord_adapter.discord = discord_mod
+    discord_adapter.DISCORD_AVAILABLE = True
+    discord_mod_ref.File = discord_mod.File
 
 
 class TestDiscordSendImageFile:
@@ -230,7 +229,7 @@ class TestDiscordSendImageFile:
         mock_channel.send = AsyncMock(return_value=mock_msg)
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
-        with patch.object(discord_mod_ref, "File", MagicMock()) as file_cls:
+        with patch("gateway.platforms.discord.discord.File", MagicMock()) as file_cls:
             result = _run(
                 adapter.send_document(
                     chat_id="67890",
@@ -256,7 +255,7 @@ class TestDiscordSendImageFile:
         mock_channel.send = AsyncMock(return_value=mock_msg)
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
-        with patch.object(discord_mod_ref, "File", MagicMock()) as file_cls:
+        with patch("gateway.platforms.discord.discord.File", MagicMock()) as file_cls:
             result = _run(
                 adapter.send_video(
                     chat_id="67890",

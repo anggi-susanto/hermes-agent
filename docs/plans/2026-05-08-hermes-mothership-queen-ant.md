@@ -409,19 +409,27 @@ Example `local_fallback_policy.yaml`:
 fallback_policy:
   mode: degraded_autonomous
   activate_if_mothership_unreachable_for_seconds: 300
-  auto_allow:
-    - read_logs
-    - git_status
-    - run_tests
-    - safe_health_checks
-    - collect_diagnostics
-  auto_block:
+  by_trust_tier:
+    sandbox:
+      auto_allow: [read_logs]
+    dev:
+      auto_allow: [read_logs, git_status, run_tests, collect_local_diagnostics]
+    ops:
+      auto_allow: [read_logs, git_status, collect_local_diagnostics]
+      auto_block:
+        - ssh_to_other_nodes
+        - lateral_health_checks
+    prod:
+      auto_allow: [read_logs, collect_local_diagnostics]
+      require_existing_approval_for_any_continuation: true
+  global_auto_block:
     - vault_write
     - prod_deploy
     - billing_change
     - credential_rotation
     - third_party_security_testing
     - destructive_migration
+    - cross_node_ssh
   report_mode:
     while_offline: append_local_jsonl
     on_reconnect: replay_with_original_timestamps
@@ -430,6 +438,8 @@ fallback_policy:
 Rules:
 
 - fallback never grants new power; it only preserves explicitly safe read-only/reversible work.
+- fallback allowlists are filtered by trust tier; `ops` does not imply lateral SSH while disconnected.
+- `safe_health_checks` means local process/file checks only unless the policy explicitly says otherwise.
 - local logs are replayed to Mothership after reconnect and marked `source: offline_worker_replay`.
 - any blocked action becomes `needs_mothership_or_albert_approval`.
 - workers with active irreversible work continue only if the approval and idempotency key were already issued before disconnect; otherwise they stop and report.
@@ -476,6 +486,20 @@ idempotency_key: deploy:pramana-os:2026-05-08:abc123
 requires_human_review_before_requeue: true
 ```
 
+State transitions:
+
+```text
+claimed
+  -> in_progress_reversible
+      -> completed
+      -> failed
+      -> requeued_when_lease_expired
+      -> in_progress_irreversible
+          -> completed
+          -> failed
+          -> orphaned_needs_human_review  # lease expired; never auto-requeue
+```
+
 Rules:
 
 1. All tasks start in `claimed` or `in_progress_reversible`.
@@ -484,6 +508,25 @@ Rules:
 4. Requeue is only valid from `claimed` or `in_progress_reversible`.
 5. Every external mutation must have an idempotency key. If the key is already `completed`, a retry reports success without repeating the action. If the key is `in_progress`, the new worker waits or escalates.
 6. Side-effecting workflows should include compensating actions where practical, but rollback must be predefined; the LLM should not improvise rollback in panic mode.
+
+Example SQLite guard for irreversible transition:
+
+```sql
+BEGIN IMMEDIATE;
+UPDATE tasks
+SET execution_phase = 'in_progress_irreversible',
+    idempotency_key = :idempotency_key,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = :task_id
+  AND active_worker_id = :worker_id
+  AND execution_phase = 'in_progress_reversible'
+  AND lease_expires_at > CURRENT_TIMESTAMP;
+-- if rows_affected != 1: ROLLBACK and abort the mutation
+INSERT INTO idempotency_keys(key, task_id, status, created_at)
+VALUES (:idempotency_key, :task_id, 'in_progress', CURRENT_TIMESTAMP)
+ON CONFLICT(key) DO NOTHING;
+COMMIT;
+```
 
 This is the boring state-machine spine that keeps "summon autonomous worker" from becoming "double deploy because the Wi-Fi sneezed."
 
@@ -582,6 +625,21 @@ Budget actions:
 - Critical-only mode: allow health, incidents, and explicit Albert-approved tasks.
 
 Budget enforcement must be pre-call, not post-fact. Each mission receives a shared budget envelope; parent agents allocate budget slices to child agents; every LLM/tool call that can incur provider cost reserves budget synchronously before execution.
+
+Atomic pre-call reservation mechanism:
+
+```text
+before every LLM/provider call:
+  1. worker opens local budget ledger transaction: SQLite BEGIN IMMEDIATE
+  2. estimate max cost from input tokens, requested max output tokens, model rate, and safety margin
+  3. if estimated_cost > budget_remaining: reject call with BUDGET_EXCEEDED and escalate
+  4. decrement reserved_budget_remaining by estimated_cost and record reservation_id
+  5. execute provider call
+  6. reconcile actual_cost vs estimated_cost; release unused reserve or mark overage
+  7. replay signed budget events to Mothership on reconnect
+```
+
+Workers must not require live Mothership connectivity before every LLM call, because that would make degraded mode useless. Instead, Mothership grants a bounded mission/subtree budget lease; each worker enforces it locally with atomic decrement and later syncs signed spend events. Child agents receive explicit budget slices from the parent, never the full parent allowance.
 
 Semantic circuit breaker requirements:
 
@@ -1645,7 +1703,9 @@ Rules:
 - Specialist personas may exist as prompt/skill modes under these seven roles, but they should not create separate scheduling/permission surfaces until there is repeated evidence they are needed.
 - For small missions, prefer one Orchestrator plus optional Reviewer/Ops over a ten-agent ceremony. Jangan bikin rapat kabinet buat deploy side project.
 
-### K. Domain Agent Families / Ship Crew
+### Appendix A. Full Ship Taxonomy (Post-MVP Reference Only)
+
+**Implementation warning:** this section is a possibility map, not the MVP role taxonomy. The MVP scheduler, permissions, dashboards, and policy rules must use the seven roles in `K. MVP Crew Model` only. Do not build these specialist personas as permanent always-on services until a real mission repeatedly proves the need. Otherwise we are back to a 25-agent bureaucracy with antennae.
 
 Mothership should think less like a random bag of workers and more like a ship/colony crew. Every specialist agent has:
 
@@ -2032,6 +2092,16 @@ Potential API surface:
 - `POST /expansion/proposals/{id}/approve`
 - `POST /skills/proposals`
 
+API authentication rules:
+
+- Every Mothership API request must be authenticated; no endpoint trusts `node_id` from the body alone.
+- `/nodes/enroll` uses a one-time invite token generated by an approved bootstrap/enrollment plan; successful enrollment binds the node to a worker public key and trust tier, then burns the invite.
+- Worker endpoints such as `/nodes/heartbeat`, `/nodes/facts`, `/tasks/claim`, `/runs/{id}/events`, `/usage`, and `/incidents` require a bearer worker token or an equivalent signed request verified against the worker public key in the registry.
+- Worker tokens must include `node_id`, `worker_id`, `trust_tier`, `capabilities`, `exp`, `iat`, `jti`, and `policy_version`; revoked `jti` values are rejected.
+- Worker tokens can report/claim only within their allowed capability/trust scope. They cannot call `/kill-switch`, approve high-risk actions, issue credentials, or mutate other node records.
+- `/kill-switch`, `/credentials/issue`, `/credentials/revoke`, and high-risk approval endpoints require Albert/admin session authority plus the durable approval object rules. A worker token alone is never sufficient.
+- Audit event ingestion marks whether an event is Mothership-observed, authenticated worker-reported, or offline replay; fake or out-of-scope events are rejected before append.
+
 Transport options:
 
 - SSH for bootstrap/break-glass
@@ -2411,6 +2481,8 @@ Deliverables:
 - structured worker report schema
 - trace ID and mission ID propagation
 - pre-call budget ledger for local calls
+- atomic local budget reservation and post-call reconciliation
+- usage event sync from worker to Mothership
 
 Acceptance proof:
 
@@ -2459,8 +2531,8 @@ Acceptance proof:
 Deliverables:
 
 - task lifecycle state machine
-- `execution_phase` transitions
-- irreversible-action lock
+- `execution_phase` transitions with explicit claimed -> reversible -> irreversible -> completed/orphaned path
+- irreversible-action lock with SQLite `UPDATE ... WHERE execution_phase = 'in_progress_reversible'` guard
 - idempotency-key table
 - reconciler three-state model: degraded alert-only, unreachable, intervention_required
 - no reconciler mutation on active task leases
@@ -2493,6 +2565,7 @@ Acceptance proof:
 Deliverables:
 
 - worker pull/webhook task API as default transport
+- authenticated API requests with one-time enrollment tokens, worker JWT/signed requests, and admin-only kill switch
 - SSH reduced to bootstrap/break-glass/manual observer sweeps
 - optional event bus decision record: when Redis/NATS/Postgres/gRPC becomes worth it, with NATS JetStream favored for disconnected telemetry replay
 - standby/backup/restore runbook

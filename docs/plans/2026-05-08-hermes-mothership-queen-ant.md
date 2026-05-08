@@ -68,16 +68,20 @@ These findings are accepted as architecture requirements, not optional polish:
 7. **Crew taxonomy must be collapsed for MVP.** Specialist personas are useful, but starting with 25 active roles creates coordination theater.
 8. **Bug bounty/revenue automation must be legally gated.** Scouting is safe; active third-party testing is never autonomous.
 9. **Memory and project knowledge must be scope-tagged.** Cross-project context bleed is a real failure mode.
-10. **Telegram is a cockpit, not sole authority for dangerous mutation.** It can request/approve with guardrails, but high-risk changes need durable approval objects and optional second-channel confirmation.
+10. **Data lifecycle and compliance must be designed before telemetry spreads.** Append-only operational audit does not mean storing raw personal data forever. Personal/client/minor-related payloads need masking, retention classes, deletion propagation, and exportable evidence of deletion.
+11. **Semantic retry loops are a Denial-of-Wallet vector.** HTTP retry limits are insufficient because agents can re-plan the same intent with different wording. The orchestrator needs intent-level circuit breakers and synchronous per-turn spend caps.
+12. **Transport reliability is a real architectural risk.** SSH is acceptable for bootstrap/break-glass, but heartbeat/task flow must move to pull/webhook early, with a clear escalation path to buffered transport such as NATS JetStream if observed jitter/offline replay makes webhook insufficient.
+13. **Telegram is a cockpit, not sole authority for dangerous mutation.** It can request/approve with guardrails, but high-risk changes need durable approval objects and optional second-channel confirmation.
 
 ### Modified / Rejected Findings
 
 Some audit recommendations are directionally correct but too heavy for the first implementation:
 
-- **NATS/gRPC from day one:** rejected for MVP. Start with SSH bootstrap + pull/webhook heartbeat. Add event bus when worker count or network pain justifies it.
-- **SPIFFE/SPIRE from day one:** rejected for MVP. Start with asymmetric worker identity, short-lived signed JWTs, jti revocation, and external secrets backend. SPIFFE/SPIRE is a later maturity step.
-- **Temporal/Rust typestate from day one:** rejected for Hermes MVP. Implement explicit Python/SQLite state machines and tests first. Move to Temporal/Rust/Go only after workflow complexity demands it.
+- **NATS/gRPC from day one:** modified. Do not install a heavy event-bus stack before the read-only MVP exists, but also do not design around SSH polling. MVP 1 must use local SQLite + append-only JSONL + pull/webhook heartbeat as the normal path; SSH is bootstrap/break-glass/manual observer only. NATS JetStream or equivalent becomes mandatory once we observe sustained offline replay needs, false-positive dead-node alerts, or worker/event volume that webhook cannot handle.
+- **SPIFFE/SPIRE from day one:** modified. Start with asymmetric worker identity, short-lived signed JWTs, jti revocation, and external secrets backend. Keep SPIFFE/SPIRE/Vault SVID as the target maturity path once the colony handles high-value secrets or many nodes.
+- **Temporal/Rust typestate from day one:** modified. Implement explicit Python/SQLite state machines, idempotency keys, and tests first. Temporal/Saga orchestration becomes required for multi-step external side effects that cannot be safely modeled with a single local transaction and idempotency table.
 - **Abolish Telegram entirely:** rejected. Telegram remains useful for Albert-facing UX, read-only status, and approval prompts. It must not be the only control for high-risk mutation.
+- **Immutable logs everywhere:** modified. Security audit events should be append-only, but raw payloads that may contain personal/client data must be masked, referenced, retained by class, and deletable through a deterministic propagation mechanism.
 
 ### Non-Negotiable Hardening Gates
 
@@ -87,7 +91,9 @@ Do not start implementation of remote mutation until these exist:
 - External secrets backend selected and wired at least as a stubbed interface.
 - Worker identity model: asymmetric keypair or short-lived signed token with revocation.
 - Append-only audit JSONL with export path.
+- Data classification, masking/redaction pipeline, retention classes, and deterministic delete propagation for payloads that may contain personal/client data.
 - Pre-call budget ledger and delegation-subtree budget allocation.
+- Semantic circuit breaker for repeated conceptual retries, plus hard per-turn spend caps.
 - Task state machine with `execution_phase` and irreversible-action handling.
 - Bootstrap approval object with out-of-band host fingerprint confirmation.
 - Project knowledge scope tags and brief-time filtering.
@@ -430,7 +436,7 @@ Rules:
 
 This prevents the colony from becoming useless during Mothership downtime without turning every worker into a rogue mini-kingdom.
 
-### 4.2 Domain Agents Can Report Upward
+### 4.3 Domain Agents Can Report Upward
 
 Mothership should also support specialist agents that own ongoing domains and report upward on demand.
 
@@ -454,7 +460,7 @@ This creates a hierarchy of responsibility:
 
 Mothership can answer simple questions directly from cached reports. It should only perform fresh deep checks when reports are stale, missing, suspicious, or the user asks for live verification.
 
-### 4.3 Safe Task State Machine
+### 4.4 Safe Task State Machine
 
 Every mission/task must carry deterministic lifecycle fields. LLM agents may choose how to solve a task inside their lane, but they do not get to invent lifecycle transitions for side-effecting work.
 
@@ -575,6 +581,16 @@ Budget actions:
 - 100%: block non-critical jobs.
 - Critical-only mode: allow health, incidents, and explicit Albert-approved tasks.
 
+Budget enforcement must be pre-call, not post-fact. Each mission receives a shared budget envelope; parent agents allocate budget slices to child agents; every LLM/tool call that can incur provider cost reserves budget synchronously before execution.
+
+Semantic circuit breaker requirements:
+
+- Track `semantic_intent_hash`, not only exact URL/body/tool name.
+- If the same conceptual action fails three times in one mission/turn window, return a hard `TOOL_UNAVAILABLE` / `CIRCUIT_OPEN` result instead of letting the agent rephrase and retry forever.
+- Count repeated failures across tool variants when the desired state is equivalent, e.g. "deploy staging", "retry rollout", and "run deployment job again".
+- Store breaker events in the audit log with mission, worker, tool, intent hash, failure class, cost already spent, and recommended human action.
+- Provider/API-key hard spending limits remain the bottom circuit breaker, but Mothership should trip earlier before the bill turns into a clown mortgage.
+
 Mothership should answer:
 
 - Which worker was most expensive today?
@@ -613,11 +629,12 @@ credentials_policy:
 
 Preferred design:
 
-- Mothership stores credential references, not raw secrets where possible.
-- Workers receive scoped tokens only.
+- Mothership stores credential references/session IDs, not raw secrets.
+- Workers receive scoped, short-lived tokens only.
 - Vault/env writes always require Albert approval and before/after diff.
 - Credential rotation and revocation are first-class operations.
 - Provider subscription metadata is visible centrally.
+- MVP identity can be asymmetric worker keys + signed JWTs with `jti` revocation; target maturity is SPIFFE/SPIRE or Vault SVID for high-value/many-node deployments.
 
 ### 8. Policy Engine and Approval Rules
 
@@ -658,7 +675,57 @@ Important Albert-specific policy:
 - Do not silently update Vault.
 - Deploy semantics must respect repo boundaries, especially CentraCast backend vs runtime.
 
-### 9. Trust Tiers and Quarantine
+### 9. Data Classification, Compliance, and Deletion Propagation
+
+Mothership needs auditability without accidentally building a permanent personal-data landfill. Append-only audit is for operational evidence; it is not permission to retain raw prompts, customer records, private documents, or minor-related data forever.
+
+Minimum data classes:
+
+```yaml
+data_classes:
+  operational_metadata:
+    examples: [task_id, worker_id, timestamps, status, cost, tool_name]
+    retention: long
+    append_only_ok: true
+  proof_artifact_reference:
+    examples: [commit_hash, pr_url, deployment_id, screenshot_path]
+    retention: project_policy
+    append_only_ok: true
+  raw_payload:
+    examples: [user_prompt, document_text, logs, copied database rows]
+    retention: short_by_default
+    append_only_ok: false
+    require_masking_before_llm: true
+  personal_or_client_data:
+    examples: [email, phone, address, credentials, private customer data]
+    retention: explicit_policy_only
+    append_only_ok: false
+    require_delete_propagation: true
+  minor_related_data:
+    examples: [child account data, school/parental context, age-indicating records]
+    retention: avoid_unless_required
+    append_only_ok: false
+    require_strict_consent_and_delete_sla: true
+```
+
+Required primitives:
+
+- `data_subject_id` / `tenant_id` / `project_id` tags where applicable.
+- `payload_ref` instead of embedding raw payload inside audit rows.
+- masking/redaction before LLM calls and before telemetry export.
+- deletion request table with propagation status per worker/artifact store.
+- worker-side delete receipt: `node_id`, `request_id`, `deleted_refs`, `completed_at`, `signature`.
+- retention sweep that can prune raw payload caches while preserving non-personal operational audit events.
+
+Indonesian PDP/GR compliance note:
+
+- Treat Indonesian PDP-style deletion/consent-withdrawal SLA as a design constraint when handling personal data, especially anything related to minors or client/customer records.
+- MVP should avoid ingesting such data into Mothership unless the data lifecycle path already exists.
+- If a workflow requires personal data, the approval object must state data class, retention, masking, deletion path, and whether data leaves the sovereign/private network.
+
+This keeps evidence useful without creating a legally radioactive JSONL museum. Very Web3 of us if we ignored it; therefore, we do not.
+
+### 10. Trust Tiers and Quarantine
 
 Trust tier example:
 
@@ -698,7 +765,7 @@ Quarantine behavior:
 - preserve logs and run history
 - notify Albert with recommended recovery
 
-### 10. Incident Management
+### 11. Incident Management
 
 Mothership detects and summarizes incidents.
 
@@ -736,16 +803,16 @@ Alert policy should avoid spam:
 - daily digest for normal status
 - silence if all green unless configured otherwise
 
-### 11. Shared Task Board / Event Bus
+### 12. Shared Task Board / Event Bus
 
 Multi-server workers need a real source of truth.
 
 Possible phases:
 
-- MVP: Mothership local SQLite + SSH polling.
-- Better: HTTP API for heartbeat/task/report.
-- Mature: Postgres + Redis/NATS/event bus.
-- Hermes-native future: remote-capable Hermes Kanban API.
+- MVP: Mothership local SQLite + append-only JSONL + pull/webhook heartbeat/task/report.
+- SSH: bootstrap, break-glass, manual observer health sweep only; not the normal heartbeat loop.
+- Buffered transport escalation: NATS JetStream/Redis/Postgres queue when webhook/pull shows false dead-node alerts, offline replay gaps, or volume pain.
+- Hermes-native future: remote-capable Hermes Kanban API layered on the same task/audit semantics.
 
 Useful endpoints:
 
@@ -757,7 +824,7 @@ Useful endpoints:
 - `POST /usage/report`
 - `POST /incidents/report`
 
-### 12. Artifact and Proof Store
+### 13. Artifact and Proof Store
 
 Workers should return proof, not only final prose.
 
@@ -784,7 +851,7 @@ Proof should be tied to:
 - timestamp
 - approval ID if applicable
 
-### 13. Memory, Skill, and Config Federation
+### 14. Memory, Skill, and Config Federation
 
 Do not merge all worker memory raw. That causes cross-project contamination.
 
@@ -818,7 +885,7 @@ Config drift detection:
 - approval mode
 - secret redaction/privacy settings
 
-### 14. UI and Command Surface
+### 15. UI and Command Surface
 
 CLI examples:
 
@@ -2032,9 +2099,10 @@ The ladder below supersedes the earlier fantasy-roadmap interpretation. It is in
 
 #### MVP 0: Local State + Architecture Grounding
 
-- SQLite runtime schema for nodes, workers, missions, tasks, approvals, budgets, audit pointers.
+- SQLite runtime schema for nodes, workers, missions, tasks, approvals, budgets, audit pointers, data classes, delete requests, and circuit-breaker events.
 - YAML only as seed/config, not mutable runtime state.
 - Project packs and knowledge scope tags.
+- Data lifecycle policy: classification, masking, retention, and deletion propagation shape.
 - Seven-role MVP crew model.
 - No remote mutation.
 
@@ -2047,9 +2115,10 @@ Acceptance proof:
 #### MVP 1: Read-Only Registry / Heartbeat / Audit
 
 - Node and worker registry.
-- Read-only heartbeat ingest.
+- Read-only pull/webhook heartbeat ingest.
 - SSH health sweep for manual/observer mode only.
-- Append-only JSONL audit log.
+- Append-only JSONL audit log for operational metadata.
+- Payload references + masking/redaction path for raw/personal data.
 - Daily/status digest via Telegram/CLI.
 
 Acceptance proof:
@@ -2066,6 +2135,7 @@ Acceptance proof:
 - Collect structured worker report.
 - Trace ID across mission, worker report, and audit event.
 - Pre-call budget ledger for Mothership-side calls.
+- Semantic circuit breaker for repeated conceptual retries.
 
 Acceptance proof:
 
@@ -2133,7 +2203,7 @@ Acceptance proof:
 #### MVP 7: Event Bus / HA / Scale
 
 - Move normal worker communication from SSH toward pull/webhook API.
-- Optional Redis/NATS/Postgres if worker count or network conditions justify it.
+- Buffered transport decision: Redis/NATS/Postgres/gRPC only when measured webhook/pull pain justifies it; NATS JetStream is the preferred candidate for offline telemetry replay.
 - Hot standby or backup/restore plan for Mothership.
 - OTel/OpenInference-compatible spans if JSONL tracing becomes painful.
 - Provider/API-key hard spending limits as final circuit breaker.
@@ -2394,6 +2464,7 @@ Deliverables:
 - idempotency-key table
 - reconciler three-state model: degraded alert-only, unreachable, intervention_required
 - no reconciler mutation on active task leases
+- Saga/Temporal escalation decision record for multi-step external side effects
 
 Acceptance proof:
 
@@ -2421,9 +2492,9 @@ Acceptance proof:
 
 Deliverables:
 
-- worker pull/webhook task API
-- SSH reduced to bootstrap/break-glass
-- optional event bus decision record: when Redis/NATS/Postgres becomes worth it
+- worker pull/webhook task API as default transport
+- SSH reduced to bootstrap/break-glass/manual observer sweeps
+- optional event bus decision record: when Redis/NATS/Postgres/gRPC becomes worth it, with NATS JetStream favored for disconnected telemetry replay
 - standby/backup/restore runbook
 - trace export improvements if JSONL is insufficient
 
@@ -2440,6 +2511,7 @@ Do not build these accidentally:
 - A central all-powerful agent that owns every secret.
 - A recursive spawn pyramid with no depth/budget limit.
 - A raw transcript-sharing memory soup across projects.
+- A raw personal-data telemetry lake with no masking, retention, or deletion propagation.
 - A system that auto-approves Vault/env/prod/billing changes.
 - A distributed worker system with no append-only audit log.
 - A system that requires every task to flow through Mothership if direct worker use is simpler.
@@ -2448,40 +2520,44 @@ Do not build these accidentally:
 - Mothership as a raw secret store.
 - Automatic requeue of irreversible side-effecting tasks.
 - Autonomous active bug bounty testing against third-party targets.
-- Full NATS/SPIFFE/Temporal/OTel stack before the boring MVP proves it needs them.
+- Full NATS/SPIFFE/Temporal/OTel stack before the boring MVP proves it needs them — but do preserve clear escalation hooks so the MVP does not paint itself into a corner.
 
 ## Design Decisions After Audit
 
 These are no longer open for the initial implementation:
 
 1. **Runtime registry/state:** SQLite from MVP 0. YAML may seed config only.
-2. **Bootstrap transport:** SSH-first for bootstrap/break-glass, but not for long-term task/heartbeat flow.
-3. **Normal worker transport:** start with pull/webhook API after read-only MVP; consider Redis/NATS only after evidence.
-4. **Node identity:** asymmetric worker identity or short-lived signed JWT with `node_id`, `trust_tier`, `expires_at`, and `jti` revocation. Signing key lives in secrets backend.
+2. **Bootstrap transport:** SSH-first for bootstrap/break-glass/manual observer sweeps, but not for long-term task/heartbeat flow.
+3. **Normal worker transport:** start with pull/webhook API in the read-only MVP; consider Redis/NATS/gRPC only after measured evidence. If disconnected telemetry replay becomes important, prefer NATS JetStream as the first serious candidate.
+4. **Node identity:** asymmetric worker identity or short-lived signed JWT with `node_id`, `trust_tier`, `expires_at`, and `jti` revocation. Signing key lives in secrets backend. SPIFFE/SPIRE remains the maturity target for high-value/many-node deployments.
 5. **Secrets:** external secrets backend interface is required before remote mutation.
-6. **Audit:** append-only JSONL from day one, exported to an external sink when available.
-7. **Crew model:** seven MVP roles; specialist roles are modes/capabilities until proven necessary.
-8. **Telegram:** allowed for status, low-risk commands, and approval UX; not sole authority for high-risk mutation.
-9. **Bug bounty:** scout/read-only by default; active testing requires per-target approval and scope document.
+6. **Audit:** append-only JSONL from day one for operational metadata, exported to an external sink when available. Raw/personal payloads are referenced, masked, retained by policy, and deletable.
+7. **Data lifecycle:** data classification, masking, retention, and delete propagation are part of MVP 0/1, not a compliance garnish for future lawyers to cry over.
+8. **Circuit breaker:** pre-call budget and semantic retry breaker are required before worker summon can spend real money.
+9. **Crew model:** seven MVP roles; specialist roles are modes/capabilities until proven necessary.
+10. **Telegram:** allowed for status, low-risk commands, and approval UX; not sole authority for high-risk mutation.
+11. **Bug bounty:** scout/read-only by default; active testing requires per-target approval and scope document.
 
 Still open, but not blocking the boring MVP:
 
 1. Which secrets backend is easiest for Albert's setup first: Vault OSS, Bitwarden Secrets Manager, Infisical, or existing host-level secret files wrapped by an adapter?
 2. Which first real colony should validate the MVP: CentraCast agents, Hermes Agent agents, or docs/research workers?
-3. When does event bus become worth it: worker count threshold, heartbeat volume, or observed SSH/webhook pain?
+3. When does event bus become worth it: worker count threshold, heartbeat volume, observed webhook/pull pain, offline replay needs, or Indonesian ISP jitter causing false dead-node alerts?
 4. Which external audit sink should be used first: separate git repo, object storage with lock, or low-tech Telegram/channel mirror?
+5. Which data classes will Mothership explicitly refuse to ingest until delete propagation and masking are verified?
 
 ## Initial Product Slice Recommendation
 
 Start with a boring but useful, audit-hardened observer:
 
 1. Create SQLite registry/runtime schema.
-2. Add append-only JSONL audit writer.
-3. Add read-only node/worker inventory and heartbeat ingest.
-4. Add daily/incident Telegram digest.
-5. Add seven-role worker capability/focus fields.
-6. Add project knowledge scope tags.
-7. Add cost placeholders/manual budgets plus pre-call ledger shape.
-8. Add explicit approval policy file.
+2. Add append-only JSONL audit writer for operational metadata.
+3. Add data-classification, masking, retention, and delete-request tables.
+4. Add read-only node/worker inventory and pull/webhook heartbeat ingest.
+5. Add daily/incident Telegram digest.
+6. Add seven-role worker capability/focus fields.
+7. Add project knowledge scope tags.
+8. Add cost placeholders/manual budgets plus pre-call ledger and semantic circuit-breaker shape.
+9. Add explicit approval policy file.
 
 Only after observer mode is stable, add quarantined bootstrap. Only after secrets, approval, budget, audit, and task state machine exist, add remote mutation. Boring first, secure first, ant empire later. 🐜👑

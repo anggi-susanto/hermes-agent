@@ -1316,10 +1316,22 @@ class TelegramAdapter(BasePlatformAdapter):
             except (ImportError, AttributeError):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
+            collapsible = bool(metadata.get("collapsible") if metadata else False)
+            collapse_button_label = (
+                str(metadata.get("collapse_button_label") or "Minimize")
+                if metadata else "Minimize"
+            )
+            collapse_reply_markup = None
+            if collapsible:
+                collapse_reply_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(collapse_button_label, callback_data="tc:min")
+                ]])
+
             for i, chunk in enumerate(chunks):
                 should_thread = self._should_thread_reply(reply_to, i)
                 reply_to_id = int(reply_to) if should_thread else None
                 effective_thread_id = self._message_thread_id_for_send(thread_id)
+                reply_markup = collapse_reply_markup if i == 0 else None
 
                 msg = None
                 for _send_attempt in range(3):
@@ -1344,6 +1356,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 message_thread_id=effective_thread_id,
+                                reply_markup=reply_markup,
                                 **self._link_preview_kwargs(),
                             )
                         except Exception as md_error:
@@ -1367,6 +1380,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     message_thread_id=effective_thread_id,
+                                    reply_markup=reply_markup,
                                     **self._link_preview_kwargs(),
                                 )
                             else:
@@ -2073,6 +2087,27 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Collapsible interim/status message callbacks ---
+        if data == "tc:min":
+            await query.answer(text="Diminimalkan")
+            try:
+                current_text = getattr(query.message, "text", "") if query.message else ""
+                first_line = next(
+                    (line.strip() for line in str(current_text).splitlines() if line.strip()),
+                    "Ringkasan sebelum tindakan",
+                )
+                if len(first_line) > 96:
+                    first_line = first_line[:93].rstrip() + "..."
+                await query.edit_message_text(
+                    text=f"▸ {first_line}",
+                    parse_mode=None,
+                    reply_markup=None,
+                    **self._link_preview_kwargs(),
+                )
+            except Exception:
+                pass
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---

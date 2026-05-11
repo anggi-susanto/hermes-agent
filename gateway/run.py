@@ -13599,11 +13599,16 @@ class GatewayRunner:
                 if already_streamed or not _status_adapter or not str(text or "").strip():
                     return
                 try:
+                    interim_metadata = dict(_status_thread_metadata) if _status_thread_metadata else {}
+                    interim_metadata.update({
+                        "collapsible": True,
+                        "collapse_button_label": "Minimize",
+                    })
                     asyncio.run_coroutine_threadsafe(
                         _status_adapter.send(
                             _status_chat_id,
                             text,
-                            metadata=_status_thread_metadata,
+                            metadata=interim_metadata,
                         ),
                         _loop_for_step,
                     )

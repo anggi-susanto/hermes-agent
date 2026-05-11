@@ -759,10 +759,15 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
+            commentary_metadata = dict(self.metadata) if self.metadata else {}
+            commentary_metadata.update({
+                "collapsible": True,
+                "collapse_button_label": "Minimize",
+            })
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=commentary_metadata,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser

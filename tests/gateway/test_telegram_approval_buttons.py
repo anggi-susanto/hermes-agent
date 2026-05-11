@@ -75,6 +75,56 @@ class _AuthRunner:
 
 
 # ===========================================================================
+# send — collapsible interim/status messages
+# ===========================================================================
+
+class TestTelegramCollapsibleMessages:
+    """Test Telegram minimize button for interim assistant messages."""
+
+    @pytest.mark.asyncio
+    async def test_collapsible_send_adds_minimize_button(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 7
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        result = await adapter.send(
+            chat_id="12345",
+            content="Ringkasan sebelum tindakan: cek file dulu.",
+            metadata={"collapsible": True},
+        )
+
+        assert result.success is True
+        kwargs = adapter._bot.send_message.call_args[1]
+        assert kwargs["reply_markup"] is not None
+
+    @pytest.mark.asyncio
+    async def test_minimize_callback_collapses_message_to_actual_first_line(self):
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = "tc:min"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.text = "Saya cek dulu file terkait.\nDetail lain yang mengganggu bila sticky."
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        await adapter._handle_callback_query(update, context)
+
+        query.answer.assert_called_once()
+        query.edit_message_text.assert_called_once()
+        edit_kwargs = query.edit_message_text.call_args[1]
+        assert "▸ Saya cek dulu file terkait" in edit_kwargs["text"]
+        assert "Detail lain" not in edit_kwargs["text"]
+        assert edit_kwargs["reply_markup"] is None
+
+
+# ===========================================================================
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================
 

@@ -63,10 +63,15 @@ RUN cd web && npm run build && \
     node --input-type=module -e "await import('@hermes/ink')"
 
 # ---------- Permissions + Python virtualenv ----------
+# Make install dir world-readable so any HERMES_UID can read it at runtime.
 # Keep the venv outside /opt/hermes so runtime entrypoint activation survives
-# image layout changes and matches docker/entrypoint.sh.
+# image layout changes and matches docker/entrypoint.sh. node_modules trees
+# additionally need to be writable by the hermes user so runtime npm checks
+# can repair/install packages without EACCES.
 USER root
-RUN mkdir -p /opt/hermes-venv &&     chown -R hermes:hermes /opt/hermes /opt/hermes-venv &&     chmod -R a+rX /opt/hermes
+RUN mkdir -p /opt/hermes-venv && \
+    chown -R hermes:hermes /opt/hermes /opt/hermes-venv /opt/hermes/ui-tui /opt/hermes/node_modules && \
+    chmod -R a+rX /opt/hermes
 USER hermes
 RUN uv venv /opt/hermes-venv &&     uv pip install --python /opt/hermes-venv/bin/python --no-cache-dir -e ".[all]"
 USER root

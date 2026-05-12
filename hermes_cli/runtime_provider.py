@@ -384,10 +384,14 @@ def _try_resolve_from_custom_pool(
     base_url: str,
     provider_label: str,
     api_mode_override: Optional[str] = None,
+    provider_name: Optional[str] = None,
     pool_key_override: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
-    pool_key = (pool_key_override or "").strip() or get_custom_provider_pool_key(base_url)
+    pool_key = (pool_key_override or "").strip() or get_custom_provider_pool_key(
+        base_url,
+        provider_name=provider_name,
+    )
     if not pool_key:
         return None
     try:
@@ -537,7 +541,8 @@ def _resolve_named_custom_runtime(
     # Check if a credential pool exists for this saved custom provider.
     # Prefer the already-resolved provider identity over re-reading config by
     # base_url so tests/migrations that patch runtime config still hit the same
-    # pool key as the selected custom provider entry.
+    # pool key as the selected custom provider entry. Also pass provider_name so
+    # shared custom endpoints resolve to the intended credential pool.
     custom_pool_identity = str(
         custom_provider.get("provider_key")
         or custom_provider.get("name")
@@ -552,6 +557,7 @@ def _resolve_named_custom_runtime(
         base_url,
         "custom",
         custom_provider.get("api_mode"),
+        provider_name=custom_provider.get("name"),
         pool_key_override=pool_key_override,
     )
     if pool_result:
@@ -672,8 +678,11 @@ def _resolve_openrouter_runtime(
 
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
+        # Pass requested_provider so pool lookup prefers name match over base_url,
+        # fixing credential mix-ups when multiple custom providers share a base_url.
         pool_result = _try_resolve_from_custom_pool(
             base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
+            provider_name=requested_provider if requested_norm != "custom" else None,
         )
         if pool_result:
             return pool_result

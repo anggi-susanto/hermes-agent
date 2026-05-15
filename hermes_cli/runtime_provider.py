@@ -164,7 +164,19 @@ def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
         return "chat_completions"
 
 
-_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_invoke", "bedrock_converse"}
+_VALID_API_MODES = {
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+    "bedrock_converse",
+    # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
+    # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
+    # instead of Hermes' tool dispatch. Gated behind config key
+    # `model.openai_runtime == "codex_app_server"` AND provider in
+    # {"openai", "openai-codex"}. Default is unchanged.
+    "codex_app_server",
+}
+
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
     """Validate an api_mode value from config. Returns None if invalid."""
@@ -175,70 +187,30 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
     return None
 
 
-def _bedrock_region(model_cfg: Optional[Dict[str, Any]] = None) -> str:
-    """Resolve the AWS region used by the native Bedrock runtime."""
-    model_cfg = model_cfg or {}
-    cfg_region = str(
-        model_cfg.get("region")
-        or model_cfg.get("aws_region")
-        or model_cfg.get("bedrock_region")
-        or ""
-    ).strip()
-    return (
-        cfg_region
-        or os.getenv("AWS_REGION", "").strip()
-        or os.getenv("AWS_DEFAULT_REGION", "").strip()
-        or "us-east-1"
-    )
-
-
-def _resolve_bedrock_runtime(
+def _maybe_apply_codex_app_server_runtime(
     *,
-    requested_provider: str,
-    model_cfg: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Resolve native AWS Bedrock runtime settings.
+    provider: str,
+    api_mode: str,
+    model_cfg: Optional[Dict[str, Any]],
+) -> str:
+    """Optional opt-in: rewrite api_mode → "codex_app_server" for OpenAI/Codex
+    providers when the user has explicitly enabled that runtime via
+    `model.openai_runtime: codex_app_server` in config.yaml.
 
-    Bedrock auth is handled by boto3's standard credential chain (env vars,
-    AWS_PROFILE, shared config files, or IAM role). The api_key field is a
-    non-secret sentinel so existing CLI checks know credentials are delegated
-    to AWS instead of OpenAI-style bearer auth.
-    """
-    from agent.bedrock_adapter import (
-        has_aws_credentials,
-        resolve_aws_auth_env_var,
-        resolve_bedrock_region,
-    )
+    Default behavior is preserved: when the key is unset, "auto", or empty,
+    this function is a no-op. Only providers in {"openai", "openai-codex"}
+    are eligible — other providers (anthropic, openrouter, etc.) cannot be
+    rerouted through codex.
 
-    model_cfg = model_cfg or _get_model_config()
-    is_explicit = requested_provider in ("bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon")
-    if not is_explicit and not has_aws_credentials():
-        raise AuthError(
-            "No AWS credentials found for Bedrock. Configure one of:\n"
-            "  - AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY\n"
-            "  - AWS_PROFILE (for SSO / named profiles)\n"
-            "  - IAM instance role (EC2, ECS, Lambda)\n"
-            "Or run 'aws configure' to set up credentials.",
-            code="no_aws_credentials",
-        )
-
-    region = _bedrock_region(model_cfg) or resolve_bedrock_region()
-    model_name = str(
-        model_cfg.get("default")
-        or model_cfg.get("model")
-        or os.getenv("BEDROCK_MODEL_ID", "")
-        or ""
-    ).strip()
-    return {
-        "provider": "bedrock",
-        "api_mode": "bedrock_converse",
-        "base_url": f"https://bedrock-runtime.{region}.amazonaws.com",
-        "api_key": "aws-sdk",
-        "source": resolve_aws_auth_env_var() or "aws-sdk-default-chain",
-        "requested_provider": requested_provider,
-        "region": region,
-        "model": model_name,
-    }
+    Returns the (possibly-rewritten) api_mode."""
+    if not model_cfg:
+        return api_mode
+    if provider not in ("openai", "openai-codex"):
+        return api_mode
+    runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
+    if runtime == "codex_app_server":
+        return "codex_app_server"
+    return api_mode
 
 
 def _resolve_runtime_from_pool_entry(
@@ -270,6 +242,14 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "google-gemini-cli":
         api_mode = "chat_completions"
         base_url = base_url or "cloudcode-pa://google"
+    elif provider == "minimax-oauth":
+        # MiniMax OAuth tokens are valid only against the Anthropic Messages
+        # compatible endpoint. Do not honor stale model.api_mode values from a
+        # prior OpenAI-compatible provider, or the client will hit
+        # /chat/completions under /anthropic and receive a bare nginx 404.
+        api_mode = "anthropic_messages"
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        base_url = base_url or (pconfig.inference_base_url if pconfig else "")
     elif provider == "anthropic":
         api_mode = "anthropic_messages"
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -325,7 +305,7 @@ def _resolve_runtime_from_pool_entry(
             if cfg_base_url:
                 base_url = cfg_base_url
         configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-        if provider in ("opencode-zen", "opencode-go"):
+        if provider in {"opencode-zen", "opencode-go"}:
             # Re-derive api_mode from the effective model rather than the
             # persisted api_mode: the opencode providers serve both
             # anthropic_messages and chat_completions models, so the previous
@@ -347,8 +327,14 @@ def _resolve_runtime_from_pool_entry(
     # Anthropic SDK prepends its own /v1/messages to the base_url.  Strip the
     # trailing /v1 so the SDK constructs the correct path (e.g.
     # https://opencode.ai/zen/go/v1/messages instead of .../v1/v1/messages).
-    if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
+    if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
         base_url = re.sub(r"/v1/?$", "", base_url)
+
+    # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
+    # Inert when `model.openai_runtime` is unset or "auto".
+    api_mode = _maybe_apply_codex_app_server_runtime(
+        provider=provider, api_mode=api_mode, model_cfg=model_cfg
+    )
 
     return {
         "provider": provider,
@@ -385,13 +371,9 @@ def _try_resolve_from_custom_pool(
     provider_label: str,
     api_mode_override: Optional[str] = None,
     provider_name: Optional[str] = None,
-    pool_key_override: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
-    pool_key = (pool_key_override or "").strip() or get_custom_provider_pool_key(
-        base_url,
-        provider_name=provider_name,
-    )
+    pool_key = get_custom_provider_pool_key(base_url, provider_name=provider_name)
     if not pool_key:
         return None
     try:
@@ -445,8 +427,62 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
 
     config = load_config()
 
-    # Prefer the normalized compatibility layer so v11 custom_providers and
-    # v12+ providers dict entries share the same matching and metadata shape.
+    # First check providers: dict (new-style user-defined providers)
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for ep_name, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            # Match exact name or normalized name
+            name_norm = _normalize_custom_provider_name(ep_name)
+            # Resolve the API key from the env var name stored in key_env
+            key_env = str(entry.get("key_env", "") or "").strip()
+            resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
+            # Fall back to inline api_key when key_env is absent or unresolvable
+            if not resolved_api_key:
+                resolved_api_key = str(entry.get("api_key", "") or "").strip()
+
+            if requested_norm in {ep_name, name_norm, f"custom:{name_norm}"}:
+                # Found match by provider key
+                base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+                if base_url:
+                    result = {
+                        "name": entry.get("name", ep_name),
+                        "base_url": base_url.strip(),
+                        "api_key": resolved_api_key,
+                        "model": entry.get("default_model", ""),
+                    }
+                    # The v11→v12 migration writes the API mode under the new
+                    # ``transport`` field, but hand-edited configs may still
+                    # use the legacy ``api_mode`` spelling.  Accept both —
+                    # the runtime normaliser ``_normalize_custom_provider_entry``
+                    # already does, so without this lift every migrated config
+                    # silently downgrades codex_responses / anthropic_messages
+                    # providers to chat_completions in the resolved runtime.
+                    api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
+                    if api_mode:
+                        result["api_mode"] = api_mode
+                    return result
+            # Also check the 'name' field if present
+            display_name = entry.get("name", "")
+            if display_name:
+                display_norm = _normalize_custom_provider_name(display_name)
+                if requested_norm in {display_name, display_norm, f"custom:{display_norm}"}:
+                    # Found match by display name
+                    base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+                    if base_url:
+                        result = {
+                            "name": display_name,
+                            "base_url": base_url.strip(),
+                            "api_key": resolved_api_key,
+                            "model": entry.get("default_model", ""),
+                        }
+                        api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
+                        if api_mode:
+                            result["api_mode"] = api_mode
+                        return result
+
+    # Fall back to custom_providers: list (legacy format)
     custom_providers = config.get("custom_providers")
     if isinstance(custom_providers, dict):
         logger.warning(
@@ -482,8 +518,6 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         key_env = str(entry.get("key_env", "") or "").strip()
         if key_env:
             result["key_env"] = key_env
-            if not result["api_key"]:
-                result["api_key"] = os.getenv(key_env, "").strip()
         if provider_key:
             result["provider_key"] = provider_key
         api_mode = _parse_api_mode(entry.get("api_mode"))
@@ -509,6 +543,13 @@ def _resolve_named_custom_runtime(
     requested_norm = (requested_provider or "").strip().lower()
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
+        # Check credential pool first — mirrors the named-custom-provider path
+        # so bare `provider: custom` with a configured custom_providers entry
+        # also gets its api_key from the pool instead of env var fallbacks.
+        pool_result = _try_resolve_from_custom_pool(base_url, "custom", None)
+        if pool_result:
+            pool_result["source"] = "direct-alias"
+            return pool_result
         api_key_candidates = [
             (explicit_api_key or "").strip(),
             os.getenv("OPENAI_API_KEY", "").strip(),
@@ -538,28 +579,8 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
-    # Check if a credential pool exists for this saved custom provider.
-    # Prefer the already-resolved provider identity over re-reading config by
-    # base_url so tests/migrations that patch runtime config still hit the same
-    # pool key as the selected custom provider entry. Also pass provider_name so
-    # shared custom endpoints resolve to the intended credential pool.
-    custom_pool_identity = str(
-        custom_provider.get("provider_key")
-        or custom_provider.get("name")
-        or ""
-    ).strip()
-    pool_key_override = (
-        f"custom:{_normalize_custom_provider_name(custom_pool_identity)}"
-        if custom_pool_identity
-        else None
-    )
-    pool_result = _try_resolve_from_custom_pool(
-        base_url,
-        "custom",
-        custom_provider.get("api_mode"),
-        provider_name=custom_provider.get("name"),
-        pool_key_override=pool_key_override,
-    )
+    # Check if a credential pool exists for this custom endpoint
+    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -889,7 +910,7 @@ def _resolve_explicit_runtime(
 
         base_url = explicit_base_url
         if not base_url:
-            if provider in ("kimi-coding", "kimi-coding-cn"):
+            if provider in {"kimi-coding", "kimi-coding-cn"}:
                 creds = resolve_api_key_provider_credentials(provider)
                 base_url = creds.get("base_url", "").rstrip("/")
             else:
@@ -1174,12 +1195,6 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
-    if provider == "bedrock":
-        return _resolve_bedrock_runtime(
-            requested_provider=requested_provider,
-            model_cfg=model_cfg,
-        )
-
     # Anthropic (native Messages API)
     if provider == "anthropic":
         # Allow base URL override from config.yaml model.base_url, but only
@@ -1259,7 +1274,7 @@ def resolve_runtime_provider(
         # trust boto3's credential chain — it handles IMDS, ECS task roles,
         # Lambda execution roles, SSO, and other implicit sources that our
         # env-var check can't detect.
-        is_explicit = requested_provider in ("bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon")
+        is_explicit = requested_provider in {"bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon"}
         if not is_explicit and not has_aws_credentials():
             raise AuthError(
                 "No AWS credentials found for Bedrock. Configure one of:\n"
@@ -1339,7 +1354,7 @@ def resolve_runtime_provider(
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             # Only honor persisted api_mode when it belongs to the same provider family.
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if provider in ("opencode-zen", "opencode-go"):
+            if provider in {"opencode-zen", "opencode-go"}:
                 # opencode-zen/go must always re-derive api_mode from the
                 # target model (not the stale persisted api_mode), because
                 # the same provider serves both anthropic_messages
@@ -1361,7 +1376,7 @@ def resolve_runtime_provider(
                 if detected:
                     api_mode = detected
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
-        if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
+        if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
             base_url = re.sub(r"/v1/?$", "", base_url)
         return {
             "provider": provider,

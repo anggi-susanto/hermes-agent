@@ -48,7 +48,11 @@ def test_spawn_background_review_uses_ephemeral_child_and_shuts_down_memory(monk
     parent._memory_enabled = True
     parent._user_profile_enabled = True
     parent.background_review_callback = None
+    parent.status_callback = None
     parent._safe_print = lambda *args, **kwargs: None
+    parent._cached_system_prompt = "test-cached-system-prompt"
+    import datetime as _dt
+    parent.session_start = _dt.datetime(2026, 1, 1, 12, 0, 0)
     parent._COMBINED_REVIEW_PROMPT = original_agent_cls._COMBINED_REVIEW_PROMPT
     parent._MEMORY_REVIEW_PROMPT = original_agent_cls._MEMORY_REVIEW_PROMPT
     parent._SKILL_REVIEW_PROMPT = original_agent_cls._SKILL_REVIEW_PROMPT
@@ -64,7 +68,7 @@ def test_spawn_background_review_uses_ephemeral_child_and_shuts_down_memory(monk
     child_kwargs = child_inits[0]
     assert child_kwargs["skip_memory"] is True
     assert child_kwargs["skip_context_files"] is True
-    assert child_kwargs["persist_session"] is False
+    assert "persist_session" not in child_kwargs
 
     assert any(call[0] == "shutdown" for call in child_calls)
     assert child_calls[-1][0] == "close"

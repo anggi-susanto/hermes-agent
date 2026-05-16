@@ -227,7 +227,7 @@ def _get_enabled_plugins() -> Optional[set]:
 # Data classes
 # ---------------------------------------------------------------------------
 
-_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider", "board-provider"}
 
 
 @dataclass
@@ -482,6 +482,40 @@ class PluginContext:
                 kwargs["parent_agent"] = agent
 
         return registry.dispatch(tool_name, args, **kwargs)
+
+    # -- board-provider registration -----------------------------------------
+
+    def register_board_provider(
+        self,
+        *,
+        id: str,
+        name: str,
+        auth_type: str,
+        api_base_url: str = "",
+        web_base_url: str = "",
+        api_key_env_vars: tuple[str, ...] | list[str] = (),
+        supports_user_session: bool = False,
+        supports_agent_keys: bool = True,
+    ) -> None:
+        """Register metadata for a board provider plugin.
+
+        Board providers keep Hermes' normalized board substrate in core while
+        letting domain-specific API integrations (Paperclip, Linear, Jira, etc.)
+        live in plugins.
+        """
+        from hermes_cli.board_auth import register_board_provider
+
+        register_board_provider(
+            id=id,
+            name=name,
+            auth_type=auth_type,
+            api_base_url=api_base_url,
+            web_base_url=web_base_url,
+            api_key_env_vars=api_key_env_vars,
+            supports_user_session=supports_user_session,
+            supports_agent_keys=supports_agent_keys,
+        )
+        logger.debug("Plugin %s registered board provider: %s", self.manifest.name, id)
 
     # -- context engine registration -----------------------------------------
 
@@ -879,7 +913,11 @@ class PluginManager:
             # Bundled platform plugins (gateway adapters like IRC) auto-load
             # for the same reason: every platform Hermes ships must be
             # available out of the box without the user having to opt in.
-            if manifest.source == "bundled" and manifest.kind in {"backend", "platform"}:
+            #
+            # Bundled board-provider plugins auto-load their metadata so
+            # configured board connections keep working while domain-specific
+            # API clients live outside the core fork.
+            if manifest.source == "bundled" and manifest.kind in {"backend", "platform", "board-provider"}:
                 self._load_plugin(manifest)
                 continue
 

@@ -55,6 +55,32 @@ BOARD_PROVIDER_REGISTRY: Dict[str, BoardProviderConfig] = {
 }
 
 
+def register_board_provider(
+    *,
+    id: str,
+    name: str,
+    auth_type: str,
+    api_base_url: str = "",
+    web_base_url: str = "",
+    api_key_env_vars: tuple[str, ...] | list[str] = (),
+    supports_user_session: bool = False,
+    supports_agent_keys: bool = True,
+) -> BoardProviderConfig:
+    """Register board provider metadata for core or plugin integrations."""
+    provider = BoardProviderConfig(
+        id=id,
+        name=name,
+        auth_type=auth_type,
+        api_base_url=api_base_url,
+        web_base_url=web_base_url,
+        api_key_env_vars=tuple(api_key_env_vars),
+        supports_user_session=supports_user_session,
+        supports_agent_keys=supports_agent_keys,
+    )
+    BOARD_PROVIDER_REGISTRY[id] = provider
+    return provider
+
+
 _board_lock_holder = threading.local()
 
 

@@ -1,0 +1,5 @@
+name: paperclip
+version: 1.0.0
+description: "Paperclip board provider integration. Registers Paperclip metadata and normalized board API client outside Hermes core."
+author: NousResearch
+kind: board-provider

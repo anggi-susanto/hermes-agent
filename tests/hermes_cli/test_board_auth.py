@@ -1,6 +1,7 @@
 from hermes_cli.board_auth import (
     BOARD_PROVIDER_REGISTRY,
     _board_auth_file_path,
+    register_board_provider,
     load_board_auth_store,
     save_board_auth_store,
     save_board_provider_credentials,
@@ -8,6 +9,30 @@ from hermes_cli.board_auth import (
     deactivate_board_provider,
     get_board_auth_status,
 )
+
+
+def test_register_board_provider_allows_plugins_to_extend_registry():
+    register_board_provider(
+        id="acme-board",
+        name="Acme Board",
+        auth_type="api_key",
+        api_base_url="https://acme.invalid/api",
+        web_base_url="https://acme.invalid",
+        api_key_env_vars=("ACME_BOARD_API_KEY",),
+        supports_user_session=True,
+        supports_agent_keys=False,
+    )
+
+    provider = BOARD_PROVIDER_REGISTRY["acme-board"]
+
+    assert provider.id == "acme-board"
+    assert provider.name == "Acme Board"
+    assert provider.auth_type == "api_key"
+    assert provider.api_base_url == "https://acme.invalid/api"
+    assert provider.web_base_url == "https://acme.invalid"
+    assert provider.api_key_env_vars == ("ACME_BOARD_API_KEY",)
+    assert provider.supports_user_session is True
+    assert provider.supports_agent_keys is False
 
 
 def test_paperclip_provider_registered():

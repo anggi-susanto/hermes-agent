@@ -56,6 +56,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | Plugin | Kind | Purpose |
 |---|---|---|
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
+| `rtk-rewrite` | hook | Rewrite terminal commands through [RTK](https://github.com/rtk-ai/rtk) for compact token-saving command output |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `spotify` | backend (7 tools) | Native Spotify playback, queue, search, playlists, albums, library |
 | `google_meet` | standalone | Join Meet calls, live-caption transcription, optional realtime duplex audio |
@@ -114,6 +115,53 @@ Auto-tracks and removes ephemeral files created during sessions — test scripts
 **Enabling:** `hermes plugins enable disk-cleanup` (or check the box in `hermes plugins`).
 
 **Disabling again:** `hermes plugins disable disk-cleanup`.
+
+### rtk-rewrite
+
+Rewrites Hermes `terminal` tool commands through [RTK](https://github.com/rtk-ai/rtk) before execution so noisy commands return compact, token-saving output. For example, RTK can rewrite `git status` to `rtk git status`, or `pytest` to an RTK-filtered test invocation. The filtering logic stays in RTK; Hermes only calls `rtk rewrite <command>` from a `pre_tool_call` hook and mutates the terminal command when RTK returns a replacement.
+
+**Setup:** install RTK first, then enable the bundled plugin:
+
+```bash
+# RTK install options; use whichever matches your environment
+brew install rtk
+# or: cargo install --git https://github.com/rtk-ai/rtk
+
+hermes plugins enable rtk-rewrite
+# restart Hermes after enabling plugins
+```
+
+RTK also supports its own installer path for Hermes:
+
+```bash
+rtk init --agent hermes
+```
+
+That command installs an RTK-managed Hermes plugin into `~/.hermes/plugins/rtk-rewrite` and updates `plugins.enabled`. The bundled Hermes plugin gives users the same integration directly from Hermes when RTK is already installed.
+
+**How it works:**
+
+| Hook | Behaviour |
+|---|---|
+| `pre_tool_call` | If the tool is `terminal`, run `rtk rewrite <command>` with a short timeout. If RTK returns a changed command, mutate `args["command"]`; otherwise leave the command unchanged. |
+
+**Safety and failure mode:**
+
+- Fail-open by design: missing RTK binary, timeout, subprocess error, or RTK passthrough exit all leave the original command untouched.
+- Only the terminal command string is changed; all other tool args (`workdir`, `timeout`, `background`, etc.) are preserved.
+- Dangerous-command approval and terminal guardrails still run in Hermes after the rewrite.
+- Optional tuning: set `HERMES_RTK_REWRITE_TIMEOUT` (seconds, default `2.0`) if RTK rewrite needs a longer budget on a slow machine.
+
+**Verify:**
+
+```bash
+rtk --version
+rtk rewrite 'git status'
+hermes plugins list
+hermes chat -q 'run git status'
+```
+
+**Disabling:** `hermes plugins disable rtk-rewrite`.
 
 ### observability/langfuse
 

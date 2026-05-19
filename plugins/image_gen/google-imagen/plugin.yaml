@@ -1,0 +1,7 @@
+name: google-imagen
+version: 1.0.0
+description: "Google Imagen image generation backend via Google AI Studio API key. Saves generated images to $HERMES_HOME/cache/images/."
+author: NousResearch
+kind: backend
+requires_env:
+  - GOOGLE_API_KEY
